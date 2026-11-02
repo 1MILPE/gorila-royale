@@ -1,3 +1,8 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Gorila Royale</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Lilita+One&family=Rubik:wght@400;600;800&display=swap">
@@ -89,6 +94,8 @@ body.touch #feed{top:calc(260px + env(safe-area-inset-top,0px))}
 @media (prefers-reduced-motion:reduce){.bar i{transition:none}}
 </style>
 
+</head>
+<body>
 <div id="game"></div>
 
 <div id="hud" hidden>
@@ -1214,3 +1221,6 @@ addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; cam
 requestAnimationFrame(frame);
 })();
 </script>
+
+</body>
+</html>

@@ -22,3 +22,9 @@ Abre `index.html` en un navegador de escritorio o de móvil.
 | Puños / arma | 1 / 2 (o Q) | ARMA |
 | Cambiar por el arma del suelo | E | ARMA |
 | Golpe de pecho | B | PECHO |
+
+## Jugar en línea con GitHub Pages
+
+1. En GitHub: **Settings → Pages**.
+2. En *Build and deployment*, elige **Deploy from a branch**, rama `main` y carpeta `/ (root)`, y guarda.
+3. Al cabo de un minuto el juego estará en https://1milpe.github.io/gorila-royale/
