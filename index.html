@@ -229,7 +229,7 @@ scene.fog = new THREE.Fog(0x2a1848, 70, 250);
 const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 900);
 scene.add(new THREE.HemisphereLight(0x9a8cff, 0x3a1f4a, 0.38));
 const moon = new THREE.DirectionalLight(0xb9c4ff, 0.75);
-moon.castShadow = true;
+moon.castShadow = !isTouch;
 moon.shadow.mapSize.set(isTouch ? 1024 : 2048, isTouch ? 1024 : 2048);
 Object.assign(moon.shadow.camera, { left: -50, right: 50, top: 50, bottom: -50, near: 1, far: 260 });
 moon.shadow.bias = -0.0006;
@@ -767,103 +767,1284 @@ const WEAPONS = {
 };
 for (const k in WEAPONS) WEAPONS[k].rc = RAR[WEAPONS[k].rarity] || '#b8b8c8';
 const SND = { pistola: 'pistola', ak: 'ak', escopeta: 'escopeta', tactico: 'tactico', cohetes: 'cohete' };
-const gunMetal = std({ color: 0x24252c, roughness: 0.45, metalness: 0.45 });
-const gunWood = std({ color: 0x8a5a33, roughness: 0.7 });
-const gunTan = std({ color: 0xa8916a, roughness: 0.6 });
-const batWood = std({ color: 0xc9a06a, roughness: 0.55 });
-const rocketMat = std({ color: 0x4f5a3a }), rocketTip = std({ color: 0xff6a3d, emissive: 0x551800 });
-// modelos en espacio de la mano: el cañón apunta a -Y y +Z es "arriba" cuando se apunta
+// modelos de armas detallados (diseño propio)
+// ===================== weapons_v2: detailed hand-held weapon models =====================
+// Hand-space contract: origin = right-hand grip point, forward/barrel = -Y, up = +Z, sides = ±X.
+// Every weapon is built ONCE per id: its parts are merged into one BufferGeometry per material
+// (cached through G), so an instance costs only 3-9 meshes/draw calls that share geometry + materials.
+// Exposes: weaponModel(id), rocketModel(), weaponMats. Nothing here must be disposed by the game.
+
+const WV2_S = 0.25; // world units covered by one texture tile (keeps texel density uniform)
+
+// ---------- small deterministic helpers ----------
+function wv2Rng(seed) { let s = seed >>> 0 || 1; return () => (s = (s * 16807) % 2147483647) / 2147483647; }
+function wv2Noise(n, seed) { // periodic value noise on [0,1)^2
+  const r = wv2Rng(seed), g = new Float32Array(n * n);
+  for (let i = 0; i < n * n; i++) g[i] = r();
+  return (u, v) => {
+    const x = (u - Math.floor(u)) * n, y = (v - Math.floor(v)) * n;
+    const x0 = Math.floor(x), y0 = Math.floor(y), x1 = (x0 + 1) % n, y1 = (y0 + 1) % n;
+    let fx = x - x0, fy = y - y0; fx = fx * fx * (3 - 2 * fx); fy = fy * fy * (3 - 2 * fy);
+    const a = g[y0 * n + x0], b = g[y0 * n + x1], c = g[y1 * n + x0], d = g[y1 * n + x1];
+    return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy;
+  };
+}
+function wv2Canvas(w, h, draw) { const c = document.createElement('canvas'); c.width = w; c.height = h; draw(c.getContext('2d'), w, h); return c; }
+function wv2Tex(canvas, srgb, repeat) {
+  const t = new THREE.CanvasTexture(canvas);
+  if (srgb) t.encoding = THREE.sRGBEncoding;
+  if (repeat) t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.anisotropy = 4; return t;
+}
+function wv2Pixels(w, h, fn) { // fn(u, v, out[r,g,b]) per pixel
+  return wv2Canvas(w, h, (x) => {
+    const img = x.createImageData(w, h), d = img.data, o = [0, 0, 0];
+    for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) {
+      fn(i / w, j / h, o); const k = (j * w + i) * 4;
+      d[k] = o[0]; d[k + 1] = o[1]; d[k + 2] = o[2]; d[k + 3] = 255;
+    }
+    x.putImageData(img, 0, 0);
+  });
+}
+const wv2Hex = (n) => '#' + n.toString(16).padStart(6, '0');
+
+// ---------- shared textures (built once) ----------
+const wv2Tx = (() => {
+  const T = {};
+  // light warm wood grain, tinted per material (grain runs along texture V)
+  {
+    const n0 = wv2Noise(3, 10), n1 = wv2Noise(6, 11), n2 = wv2Noise(16, 12), n3 = wv2Noise(128, 13);
+    T.wood = wv2Tex(wv2Pixels(256, 256, (u, v, o) => {
+      const ph = u * 16 + 1.2 * n0(u, v) + 0.35 * n1(u, v) + 0.08 * n2(u, v);
+      const g = 0.5 + 0.5 * Math.sin(6.2832 * ph);
+      const line = g > 0.72 ? Math.pow((g - 0.72) / 0.28, 1.5) : 0;              // thin late-wood lines
+      const streak = n3(u, (v * 0.0625) % 1);                                      // long pore streaks along V
+      const broad = n1((u * 2) % 1, v);
+      const t = Math.min(1, line * 0.5 + streak * 0.28 + broad * 0.22);
+      o[0] = 252 - t * 100; o[1] = 236 - t * 118; o[2] = 214 - t * 128;
+    }), true, true);
+  }
+  // spiral tape wrap: one helical turn per tile in V, one tile around in U
+  {
+    const n = wv2Noise(32, 21);
+    T.tape = wv2Tex(wv2Pixels(64, 64, (u, v, o) => {
+      const f = (u + v) % 1;
+      const edge = f < 0.07 ? 0.45 : f > 0.93 ? 1.18 : 1 - (f - 0.5) * 0.18;
+      const c = (200 + (n(u * 4, v * 4) - 0.5) * 40) * edge;
+      o[0] = o[1] = o[2] = Math.max(0, Math.min(255, c));
+    }), true, true);
+  }
+  // olive tube: mottled paint, stencil marks, yellow ID band near the muzzle end (canvas bottom = -Y)
+  T.tube = wv2Tex(wv2Canvas(256, 512, (x, w, h) => {
+    const n = wv2Noise(16, 31), m = wv2Noise(64, 32);
+    const img = x.createImageData(w, h), d = img.data;
+    for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) {
+      const u = i / w, v = j / h, k = (j * w + i) * 4;
+      const t = n(u, v * 2) * 0.6 + m(u, v * 2) * 0.4;
+      const end = Math.min(1, Math.min(j, h - j) / 18);
+      const s = (0.84 + t * 0.26) * (0.75 + 0.25 * end);
+      d[k] = 92 * s; d[k + 1] = 102 * s; d[k + 2] = 60 * s; d[k + 3] = 255;
+    }
+    x.putImageData(img, 0, 0);
+    x.fillStyle = '#d9b43a'; x.fillRect(0, h - 80, w, 18); x.fillRect(0, h - 54, w, 6);
+    x.fillStyle = 'rgba(230,226,196,0.82)';
+    for (const cx of [64, 192]) { // abstract stencil "data plate" glyphs + forward arrow, on both sides
+      const rr = wv2Rng(cx * 7 + 3);
+      for (let row = 0; row < 3; row++) for (let gch = 0; gch < 5; gch++) {
+        const gx = cx - 22 + gch * 9, gy = 120 + row * 16;
+        for (let a = 0; a < 3; a++) for (let b = 0; b < 5; b++) if (b !== 2 || a !== 1) { if (rr() > 0.42) x.fillRect(gx + a * 2.4, gy + b * 2.2, 2.2, 2); }
+      }
+      x.fillRect(cx - 18, 176, 36, 3);
+      x.beginPath(); x.moveTo(cx - 12, 300); x.lineTo(cx + 12, 300); x.lineTo(cx, 326); x.closePath(); x.fill();
+      x.fillRect(cx - 4, 268, 8, 30);
+    }
+    x.strokeStyle = 'rgba(214,218,176,0.25)'; x.lineWidth = 1.2; const r2 = wv2Rng(77);
+    for (let i = 0; i < 40; i++) { const sx = r2() * w, sy = r2() * h; x.beginPath(); x.moveTo(sx, sy); x.lineTo(sx + (r2() - 0.5) * 22, sy + (r2() - 0.5) * 8); x.stroke(); }
+  }), true, false);
+  // polymer stipple normal map (linear)
+  {
+    const N = 128, hgt = new Float32Array(N * N), r = wv2Rng(41);
+    for (let i = 0; i < 2600; i++) {
+      const cx = r() * N, cy = r() * N, rad = 0.8 + r() * 1.1;
+      for (let y = -3; y <= 3; y++) for (let x = -3; x <= 3; x++) {
+        const dd = (x * x + y * y) / (rad * rad); if (dd > 1) continue;
+        const px = ((Math.floor(cx) + x) % N + N) % N, py = ((Math.floor(cy) + y) % N + N) % N;
+        hgt[py * N + px] += (1 - dd) * 0.8;
+      }
+    }
+    T.stipple = wv2Tex(wv2Canvas(N, N, (x) => {
+      const img = x.createImageData(N, N), d = img.data;
+      for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+        const H = (a, b) => hgt[((b + N) % N) * N + ((a + N) % N)];
+        let nx = (H(i - 1, j) - H(i + 1, j)) * 0.35, ny = (H(i, j + 1) - H(i, j - 1)) * 0.35, nz = 1;
+        const l = Math.hypot(nx, ny, nz); nx /= l; ny /= l; nz /= l;
+        const k = (j * N + i) * 4; d[k] = (nx * 0.5 + 0.5) * 255; d[k + 1] = (ny * 0.5 + 0.5) * 255; d[k + 2] = (nz * 0.5 + 0.5) * 255; d[k + 3] = 255;
+      }
+      x.putImageData(img, 0, 0);
+    }), false, true);
+  }
+  // subtle machining variation for metals (roughness multiplier, linear)
+  {
+    const n = wv2Noise(16, 51), m = wv2Noise(64, 52);
+    T.metalRough = wv2Tex(wv2Pixels(64, 64, (u, v, o) => { o[0] = o[1] = o[2] = 190 + n(u, v) * 40 + m(u * 4 % 1, v) * 25; }), false, true);
+  }
+  // reflex-sight lens: dark glass with a glowing red dot (emissive map)
+  T.lens = wv2Tex(wv2Canvas(64, 64, (x, w, h) => {
+    x.fillStyle = '#000'; x.fillRect(0, 0, w, h);
+    const g = x.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, 20);
+    g.addColorStop(0, '#fff2f2'); g.addColorStop(0.12, '#ff3048'); g.addColorStop(0.35, 'rgba(160,0,30,0.45)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+    x.fillStyle = g; x.fillRect(0, 0, w, h);
+  }), true, false);
+  // soft glow sprite for the rocket exhaust
+  T.glow = wv2Tex(wv2Canvas(64, 64, (x, w, h) => {
+    const g = x.createRadialGradient(32, 32, 0, 32, 32, 32);
+    g.addColorStop(0, 'rgba(255,250,220,1)'); g.addColorStop(0.25, 'rgba(255,180,80,0.85)'); g.addColorStop(0.6, 'rgba(255,70,40,0.25)'); g.addColorStop(1, 'rgba(255,40,40,0)');
+    x.fillStyle = g; x.fillRect(0, 0, w, h);
+  }), true, false);
+  // tiny neon-city environment cube so metal/gloss parts pick up purple/pink/cyan reflections
+  {
+    const N = isTouch ? 64 : 128, r = wv2Rng(61), neon = NEON.map(wv2Hex);
+    const side = (k) => wv2Canvas(N, N, (x, w, h) => {
+      const g = x.createLinearGradient(0, 0, 0, h);
+      g.addColorStop(0, '#120a26'); g.addColorStop(0.38, '#2c1850'); g.addColorStop(0.52, '#6a2f7a'); g.addColorStop(0.6, '#2a1844'); g.addColorStop(1, '#0c0716');
+      x.fillStyle = g; x.fillRect(0, 0, w, h);
+      x.fillStyle = '#0d0818';
+      for (let i = 0; i < 6; i++) { const bw = w * (0.12 + r() * 0.16), bx = r() * w, top = h * (0.42 + r() * 0.16); x.fillRect(bx, top, bw, h - top); }
+      for (let i = 0; i < 7 + k; i++) {
+        const c = neon[Math.floor(r() * neon.length)], bx = r() * w, by = h * (0.4 + r() * 0.28), bw = w * (0.04 + r() * 0.16), bh = h * (0.015 + r() * 0.05);
+        x.shadowColor = c; x.shadowBlur = N * 0.08; x.fillStyle = c; x.fillRect(bx, by, bw, bh);
+      }
+      x.shadowBlur = 0;
+    });
+    const top = wv2Canvas(N, N, (x, w, h) => {
+      const g = x.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, w * 0.7);
+      g.addColorStop(0, '#5b4a9a'); g.addColorStop(0.5, '#2a1a52'); g.addColorStop(1, '#160d2c');
+      x.fillStyle = g; x.fillRect(0, 0, w, h);
+    });
+    const bottom = wv2Canvas(N, N, (x, w, h) => {
+      x.fillStyle = '#0a0612'; x.fillRect(0, 0, w, h);
+      for (let i = 0; i < 6; i++) { x.fillStyle = neon[i % neon.length]; x.globalAlpha = 0.18; x.fillRect(r() * w, r() * h, w * 0.2, h * 0.05); }
+      x.globalAlpha = 1;
+    });
+    const cube = new THREE.CubeTexture([side(0), side(1), top, bottom, side(2), side(3)]);
+    cube.encoding = THREE.sRGBEncoding; cube.needsUpdate = true;
+    T.env = cube;
+  }
+  return T;
+})();
+
+// ---------- shared materials ----------
+const weaponMats = (() => {
+  const env = wv2Tx.env;
+  // r128 treats hex colours as linear; convert so the hex values below are the intended (sRGB) look
+  const lin = (h) => new THREE.Color(h).convertSRGBToLinear();
+  const M = (o, envI) => {
+    if (o.color != null) o.color = lin(o.color);
+    if (o.emissive != null) o.emissive = lin(o.emissive);
+    return std(Object.assign({ envMap: env, envMapIntensity: envI }, o));
+  };
+  const mats = {
+    steel: M({ color: 0x5b5f6c, metalness: 0.75, roughness: 0.36, roughnessMap: wv2Tx.metalRough }, 1.2),     // machined gunmetal
+    dark: M({ color: 0x34363f, metalness: 0.65, roughness: 0.44, roughnessMap: wv2Tx.metalRough }, 1.0),     // parkerized barrels/parts
+    polymer: M({ color: 0x2c2d33, metalness: 0.05, roughness: 0.66, normalMap: wv2Tx.stipple, normalScale: new THREE.Vector2(0.5, 0.5) }, 0.6),
+    wood: M({ color: 0x8c4626, map: wv2Tx.wood, roughness: 0.46 }, 0.6),
+    tan: M({ color: 0xb08d5a, metalness: 0.1, roughness: 0.58 }, 0.6),
+    olive: M({ color: 0xffffff, map: wv2Tx.tube, metalness: 0.1, roughness: 0.68 }, 0.5),
+    od: M({ color: 0x5c6236, metalness: 0.12, roughness: 0.66 }, 0.5),
+    warhead: M({ color: 0xb8361f, metalness: 0.2, roughness: 0.4, emissive: 0x3a0c04 }, 0.7),
+    brass: M({ color: 0xd9ad55, metalness: 0.9, roughness: 0.28 }, 1.1),
+    shell: M({ color: 0xb3212e, metalness: 0.05, roughness: 0.36 }, 0.6),
+    batWood: M({ color: 0xe9c48f, map: wv2Tx.wood, roughness: 0.42 }, 0.6),
+    tape: M({ color: 0x45404c, map: wv2Tx.tape, roughness: 0.88, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -2 }, 0.3),
+    paint: M({ color: 0xff3d9a, roughness: 0.4, emissive: 0xff3d9a, emissiveIntensity: 0.35, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -2 }, 0.5),
+    lens: M({ color: 0x0c2a34, metalness: 0.9, roughness: 0.12, emissive: 0xffffff, emissiveMap: wv2Tx.lens, emissiveIntensity: 1.6, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -2 }, 1.4),
+    bore: new THREE.MeshBasicMaterial({ color: 0x050308, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -3 }), // holes/slots/ports (decal-like)
+    tritium: new THREE.MeshBasicMaterial({ color: 0x7dffb0 }),
+    flame: new THREE.MeshBasicMaterial({ color: 0xff7a2e, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false }),
+    flameCore: new THREE.MeshBasicMaterial({ color: 0xfff1c4, transparent: true, opacity: 0.95, blending: THREE.AdditiveBlending, depthWrite: false }),
+    glow: new THREE.SpriteMaterial({ map: wv2Tx.glow, color: 0xffa04a, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false })
+  };
+  return mats;
+})();
+
+// ---------- geometry merge builder ----------
+function wv2Merge(list) {
+  let nV = 0, nI = 0;
+  for (const it of list) { const p = it.geo.attributes.position; nV += p.count; nI += it.geo.index ? it.geo.index.count : p.count; }
+  const pos = new Float32Array(nV * 3), nor = new Float32Array(nV * 3), uvs = new Float32Array(nV * 2);
+  const idx = nV > 65535 ? new Uint32Array(nI) : new Uint16Array(nI);
+  const v = new THREE.Vector3(), nm = new THREE.Matrix3();
+  let vo = 0, io = 0;
+  for (const it of list) {
+    const g = it.geo, P = g.attributes.position, N = g.attributes.normal, U = g.attributes.uv, uvo = it.uv || {};
+    const su = uvo.su || 1, sv = uvo.sv || 1;
+    nm.getNormalMatrix(it.m);
+    for (let i = 0; i < P.count; i++) {
+      v.fromBufferAttribute(P, i).applyMatrix4(it.m); pos[(vo + i) * 3] = v.x; pos[(vo + i) * 3 + 1] = v.y; pos[(vo + i) * 3 + 2] = v.z;
+      v.fromBufferAttribute(N, i).applyMatrix3(nm).normalize(); nor[(vo + i) * 3] = v.x; nor[(vo + i) * 3 + 1] = v.y; nor[(vo + i) * 3 + 2] = v.z;
+      let a = U ? U.getX(i) : 0, b = U ? U.getY(i) : 0;
+      if (uvo.swap) { const t = a; a = b; b = t; }
+      uvs[(vo + i) * 2] = a * su; uvs[(vo + i) * 2 + 1] = b * sv;
+    }
+    const flip = it.m.determinant() < 0, cnt = g.index ? g.index.count : P.count;
+    for (let i = 0; i < cnt; i += 3) {
+      const a = g.index ? g.index.getX(i) : i, b = g.index ? g.index.getX(i + 1) : i + 1, c = g.index ? g.index.getX(i + 2) : i + 2;
+      idx[io + i] = vo + a; idx[io + i + 1] = vo + (flip ? c : b); idx[io + i + 2] = vo + (flip ? b : c);
+    }
+    vo += P.count; io += cnt;
+  }
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  out.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  out.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+  out.setIndex(new THREE.BufferAttribute(idx, 1));
+  out.computeBoundingSphere(); out.computeBoundingBox();
+  return out;
+}
+
+function wv2Builder() {
+  const parts = {}, temps = new Set();
+  const _e = new THREE.Euler(), _q = new THREE.Quaternion(), _p = new THREE.Vector3(), _s = new THREE.Vector3();
+  const seg = (n) => isTouch ? Math.max(6, Math.round(n * 0.67)) : n;
+  const put = (mat, geo, x, y, z, rx, ry, rz, sx, sy, sz, uv) => {
+    temps.add(geo);
+    _e.set(rx || 0, ry || 0, rz || 0); _q.setFromEuler(_e); _p.set(x || 0, y || 0, z || 0);
+    _s.set(sx == null ? 1 : sx, sy == null ? 1 : sy, sz == null ? 1 : sz);
+    (parts[mat] || (parts[mat] = [])).push({ geo, m: new THREE.Matrix4().compose(_p, _q, _s), uv });
+  };
+  const B = {
+    seg,
+    // box: w along X, l along Y (forward axis), h along Z (up); world-scaled UVs
+    box(mat, w, l, h, x, y, z, rx, ry, rz) {
+      const g = new THREE.BoxGeometry(w, l, h), uv = g.attributes.uv;
+      const dims = [[h, l], [h, l], [w, h], [w, h], [w, l], [w, l]];
+      for (let f = 0; f < 6; f++) for (let i = 0; i < 4; i++) { const k = f * 4 + i; uv.setXY(k, uv.getX(k) * dims[f][0] / WV2_S, uv.getY(k) * dims[f][1] / WV2_S); }
+      put(mat, g, x, y, z, rx, ry, rz);
+    },
+    // cylinder along Y; rRear sits at +Y (behind), rFront at -Y (toward the muzzle)
+    cyl(mat, rRear, rFront, len, x, y, z, n, rx, ry, rz, sx, sz, open, uv) {
+      const g = new THREE.CylinderGeometry(rRear, rFront, len, seg(n || 12), 1, !!open);
+      put(mat, g, x, y, z, rx, ry, rz, sx, 1, sz, uv || { su: 6.283 * Math.max(rRear, rFront) / WV2_S, sv: len / WV2_S });
+    },
+    cylX(mat, r, len, x, y, z, n) { B.cyl(mat, r, r, len, x, y, z, n || 8, 0, 0, Math.PI / 2); },
+    cylZ(mat, r, len, x, y, z, n) { B.cyl(mat, r, r, len, x, y, z, n || 8, Math.PI / 2, 0, 0); },
+    sphere(mat, r, x, y, z, n, sx, sy, sz) { put(mat, new THREE.SphereGeometry(r, seg(n || 10), Math.max(4, seg(n || 10) - 2)), x, y, z, 0, 0, 0, sx, sy, sz); },
+    // flat disc facing +Y (dir=1) or -Y (dir=-1)
+    disc(mat, r, x, y, z, dir, n) { put(mat, new THREE.CircleGeometry(r, seg(n || 14)), x, y, z, dir > 0 ? -Math.PI / 2 : Math.PI / 2, 0, 0); },
+    // lathe around Y from [r, y] pairs (ordered by increasing y for outward faces)
+    lathe(mat, pts, x, y, z, n, rx, ry, rz, uv) {
+      let rmax = 0; const v2 = pts.map(p => { rmax = Math.max(rmax, p[0]); return new THREE.Vector2(p[0], p[1]); });
+      const len = Math.abs(pts[pts.length - 1][1] - pts[0][1]);
+      put(mat, new THREE.LatheGeometry(v2, seg(n || 16)), x, y, z, rx, ry, rz, 1, 1, 1, uv || { su: 6.283 * rmax / WV2_S, sv: len / WV2_S });
+    },
+    // extruded side-profile: path of [y, z] points (or [cy, cz, y, z] quadratic segments), thickness along X
+    ext(mat, path, width, x, bevel, holes, segs) {
+      const mk = (pp, sh) => { sh.moveTo(pp[0][0], pp[0][1]); for (let i = 1; i < pp.length; i++) { const p = pp[i]; if (p.length === 4) sh.quadraticCurveTo(p[0], p[1], p[2], p[3]); else sh.lineTo(p[0], p[1]); } return sh; };
+      const shape = mk(path, new THREE.Shape());
+      if (holes) for (const h of holes) shape.holes.push(mk(h, new THREE.Path()));
+      const bv = bevel == null ? 0.005 : bevel, depth = Math.max(0.001, width - 2 * bv);
+      const g = new THREE.ExtrudeGeometry(shape, { depth, bevelEnabled: bv > 0, bevelThickness: bv, bevelSize: bv * 0.8, bevelSegments: isTouch ? 1 : 2, curveSegments: segs || (isTouch ? 4 : 7), steps: 1 });
+      const m = new THREE.Matrix4().set(0, 0, 1, (x || 0) - depth / 2, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1);
+      temps.add(g); (parts[mat] || (parts[mat] = [])).push({ geo: g, m, uv: { swap: true, su: 1 / WV2_S, sv: 1 / WV2_S } });
+    },
+    // half-loop under (y, z) in the YZ plane (trigger guards / sling loops); ky,kz stretch it
+    guard(mat, R, tube, y, z, ky, kz, x) { put(mat, new THREE.TorusGeometry(R, tube, 5, seg(12), Math.PI), x || 0, y, z, 0, Math.PI / 2, -Math.PI / 2, ky || 1, kz || 1, 1); },
+    ring(mat, R, tube, x, y, z, rx, ry, rz) { put(mat, new THREE.TorusGeometry(R, tube, 5, seg(12)), x, y, z, rx, ry, rz); },
+    done(prefix) {
+      const out = [];
+      for (const k in parts) out.push([k, G(prefix + k, () => wv2Merge(parts[k]))]);
+      temps.forEach(g => g.dispose());
+      return out;
+    }
+  };
+  return B;
+}
+
+// common raked pistol grip outline (y, z): hand grip point sits inside it at the origin
+function wv2GripPath(top, dy) {
+  dy = dy || 0;
+  return [[-0.032 + dy, top], [0.04 + dy, top], [0.046 + dy, top - 0.03], [0.05 + dy, -0.03 + top * 0.2, 0.068 + dy, -0.112], [0.064 + dy, -0.128], [0.008 + dy, -0.13],
+    [-0.006 + dy, -0.12], [-0.012 + dy, -0.07, -0.022 + dy, -0.045], [-0.03 + dy, -0.018, -0.026 + dy, 0.01], [-0.034 + dy, top * 0.6, -0.032 + dy, top]];
+}
+
+// ---------- per-weapon part lists ----------
+const wv2Parts = {};
+const wv2Build = {
+  pistola(B) {
+    const sz = 0.123; // slide centre height
+    // slide (steel) with chamfered nose
+    B.ext('steel', [[0.055, 0.088], [-0.272, 0.088], [-0.272, 0.142], [-0.258, 0.158], [0.045, 0.158], [0.055, 0.148]], 0.05, 0, 0.004);
+    for (let i = 0; i < 5; i++) B.box('bore', 0.0512, 0.003, 0.046, 0, 0.012 + i * 0.009, sz + 0.004); // rear serrations
+    for (let i = 0; i < 3; i++) B.box('bore', 0.0512, 0.003, 0.04, 0, -0.205 - i * 0.009, sz + 0.004); // front serrations
+    B.box('bore', 0.03, 0.065, 0.004, 0.004, -0.06, 0.1596);      // ejection port
+    B.box('steel', 0.022, 0.05, 0.004, 0.004, -0.066, 0.1612);   // barrel hood in port
+    B.box('dark', 0.044, 0.016, 0.016, 0, 0.042, 0.166);         // rear sight
+    B.box('bore', 0.009, 0.0165, 0.012, 0, 0.042, 0.169);        // rear notch
+    B.box('dark', 0.008, 0.014, 0.016, 0, -0.248, 0.164);        // front sight
+    for (const s of [-1, 1]) B.sphere('tritium', 0.0035, s * 0.012, 0.0505, 0.168, 6);
+    B.sphere('tritium', 0.0035, 0, -0.2405, 0.168, 6);
+    B.cyl('dark', 0.012, 0.012, 0.012, 0, -0.274, 0.13, 12);      // barrel crown
+    B.disc('bore', 0.0075, 0, -0.2805, 0.13, -1, 10);
+    // polymer frame with integral trigger guard (hole) + accessory rail
+    B.ext('polymer', [[0.05, 0.09], [-0.262, 0.09], [-0.262, 0.062], [-0.12, 0.06], [-0.122, 0.03], [-0.12, 0.004, -0.098, 0.002], [-0.03, 0.004], [-0.022, 0.06], [0.04, 0.066], [0.05, 0.078]], 0.044, 0, 0.004,
+      [[[-0.105, 0.054], [-0.106, 0.03], [-0.104, 0.015, -0.09, 0.014], [-0.036, 0.014], [-0.034, 0.054]]]);
+    for (let i = 0; i < 4; i++) B.box('polymer', 0.034, 0.008, 0.008, 0, -0.165 - i * 0.022, 0.056);
+    B.ext('polymer', wv2GripPath(0.075, 0.004), 0.046, 0, 0.006);  // grip
+    B.box('dark', 0.05, 0.072, 0.012, 0, 0.04, -0.135, 0.03);     // magazine base plate
+    B.box('dark', 0.008, 0.01, 0.034, 0, -0.068, 0.04, -0.25);     // trigger
+    B.box('dark', 0.004, 0.05, 0.009, -0.026, -0.07, 0.096);       // slide stop
+    B.box('dark', 0.004, 0.016, 0.01, -0.026, -0.13, 0.08);        // takedown
+    B.box('dark', 0.006, 0.012, 0.012, -0.024, -0.026, 0.052);     // mag release
+    return [0, -0.28, 0.13];
+  },
+
+  ak(B) {
+    const bz = 0.105; // bore axis
+    // receiver: box body + rounded dust cover + trunnion steps + rivets
+    B.ext('steel', [[0.07, 0.064], [-0.3, 0.064], [-0.3, 0.146], [0.07, 0.146]], 0.062, 0, 0.004);
+    B.cyl('steel', 0.03, 0.03, 0.36, 0, -0.11, 0.144, 16, 0, 0, 0, 1.02, 0.8);
+    B.box('steel', 0.03, 0.02, 0.02, 0, 0.07, 0.15);                // cover latch button
+    for (let i = 0; i < 3; i++) B.box('steel', 0.05, 0.007, 0.008, 0, 0.0 + i * 0.02, 0.164); // cover ribs
+    B.box('dark', 0.066, 0.045, 0.092, 0, -0.278, 0.103);           // front trunnion
+    B.box('dark', 0.006, 0.13, 0.026, -0.0335, -0.03, 0.104);       // left-side optic rail plate
+    for (const p of [[-0.268, 0.08], [-0.288, 0.08], [-0.268, 0.126], [0.05, 0.08], [0.03, 0.08], [-0.03, 0.078]]) B.cylX('dark', 0.0055, 0.07, 0, p[0], p[1], 6);
+    // selector lever (right side) + charging handle
+    B.box('dark', 0.005, 0.17, 0.016, 0.034, -0.05, 0.128, 0.07);
+    B.box('dark', 0.006, 0.03, 0.03, 0.034, 0.03, 0.118);
+    B.box('steel', 0.006, 0.08, 0.012, 0.034, -0.21, 0.132);
+    B.cylX('steel', 0.009, 0.04, 0.052, -0.245, 0.132, 10);
+    B.sphere('steel', 0.011, 0.072, -0.245, 0.132, 10);
+    // rear sight block + leaf
+    B.box('dark', 0.042, 0.06, 0.034, 0, -0.33, 0.162);
+    B.box('dark', 0.03, 0.06, 0.006, 0, -0.295, 0.18, 0.1);
+    // barrel, gas block, gas tube, front sight, muzzle brake, cleaning rod
+    B.cyl('dark', 0.0155, 0.0145, 0.54, 0, -0.57, bz, 14);
+    B.box('dark', 0.036, 0.042, 0.08, 0, -0.58, 0.14);
+    B.cyl('dark', 0.022, 0.022, 0.042, 0, -0.58, bz, 14);
+    B.cyl('steel', 0.013, 0.013, 0.08, 0, -0.53, 0.162, 10);
+    B.cyl('dark', 0.022, 0.022, 0.045, 0, -0.77, bz, 14);
+    B.box('dark', 0.04, 0.03, 0.05, 0, -0.775, 0.13);
+    for (const s of [-1, 1]) B.box('dark', 0.006, 0.026, 0.05, s * 0.017, -0.775, 0.165);
+    B.cyl('dark', 0.003, 0.003, 0.03, 0, -0.775, 0.17, 6, Math.PI / 2);
+    B.cyl('steel', 0.019, 0.021, 0.07, 0, -0.865, bz, 14);
+    B.cyl('steel', 0.022, 0.022, 0.01, 0, -0.832, bz, 14);
+    B.box('bore', 0.006, 0.03, 0.03, 0.02, -0.87, bz + 0.004);      // brake cut
+    B.disc('bore', 0.0095, 0, -0.9005, bz, -1, 12);
+    B.cyl('steel', 0.004, 0.004, 0.25, 0, -0.67, 0.08, 6);
+    B.cyl('steel', 0.006, 0.006, 0.012, 0, -0.798, 0.08, 6);
+    // wooden furniture: lower handguard, upper handguard, grip, stock
+    B.ext('wood', [[-0.31, 0.134], [-0.535, 0.134], [-0.535, 0.08], [-0.532, 0.054, -0.51, 0.054], [-0.34, 0.054], [-0.312, 0.056, -0.31, 0.08]], 0.072, 0, 0.006);
+    for (const s of [-1, 1]) B.box('wood', 0.004, 0.17, 0.008, s * 0.038, -0.42, 0.104);   // grip ribs on the handguard
+    B.box('dark', 0.078, 0.014, 0.094, 0, -0.541, 0.1);            // front retainer band
+    B.box('dark', 0.074, 0.012, 0.09, 0, -0.306, 0.1);             // rear retainer
+    B.cyl('wood', 0.026, 0.024, 0.2, 0, -0.43, 0.162, 16, 0, 0, 0, 1.2, 1.0);
+    B.cyl('dark', 0.027, 0.027, 0.014, 0, -0.537, 0.162, 14, 0, 0, 0, 1.2, 1.0);
+    B.ext('wood', [[-0.026, 0.07], [0.036, 0.07], [0.04, 0.04], [0.074, -0.11], [0.068, -0.128], [0.018, -0.13], [0.0, -0.06, -0.026, 0.02], [-0.03, 0.05]], 0.042, 0, 0.006);
+    B.ext('wood', [[0.06, 0.143], [0.345, 0.086], [0.345, -0.074], [0.33, -0.078], [0.18, 0.02, 0.075, 0.066], [0.06, 0.066]], 0.05, 0, 0.007);
+    B.box('dark', 0.058, 0.012, 0.168, 0, 0.352, 0.006);            // butt plate
+    B.box('dark', 0.02, 0.08, 0.006, 0, 0.1, 0.139, -0.2);           // stock tang
+    B.ring('dark', 0.012, 0.003, -0.03, 0.29, -0.03, 0, Math.PI / 2, 0);   // sling loop (stock)
+    B.ring('dark', 0.012, 0.003, 0, -0.541, 0.04, 0, Math.PI / 2, 0);     // sling loop (front band)
+    // trigger guard, trigger, mag catch
+    B.guard('steel', 0.045, 0.006, -0.066, 0.064, 1, 0.78);
+    B.box('dark', 0.008, 0.01, 0.036, 0, -0.06, 0.045, -0.3);
+    B.box('dark', 0.03, 0.014, 0.03, 0, -0.105, 0.05);
+    // curved magazine with ribbed sides and floor plate
+    B.ext('dark', [[-0.112, 0.066], [-0.122, -0.1, -0.2, -0.262], [-0.288, -0.232], [-0.214, -0.08, -0.206, 0.066]], 0.044, 0, 0.005, null, isTouch ? 5 : 9);
+    for (const s of [-1, 1]) B.ext('dark', [[-0.14, 0.02], [-0.15, -0.1, -0.205, -0.2], [-0.225, -0.19], [-0.17, -0.09, -0.16, 0.02]], 0.004, s * 0.024, 0, null, isTouch ? 4 : 7);
+    B.box('dark', 0.05, 0.1, 0.016, 0, -0.245, -0.255, -0.36);
+    return [0, -0.9, bz];
+  },
+
+  escopeta(B) {
+    const o = -0.03, bz = 0.14;
+    // receiver with rounded edges, ejection port, side-saddle shells, tang safety
+    B.ext('steel', [[0 + o, 0.075], [0 + o, 0.15], [0 + o, 0.168, -0.02 + o, 0.168], [-0.28 + o, 0.168], [-0.3 + o, 0.168, -0.3 + o, 0.15], [-0.3 + o, 0.075]], 0.062, 0, 0.005);
+    B.box('bore', 0.002, 0.08, 0.034, 0.0315, -0.15 + o, 0.135);
+    B.box('steel', 0.003, 0.07, 0.006, 0.0318, -0.15 + o, 0.114);
+    B.cylZ('dark', 0.007, 0.012, 0, -0.005 + o, 0.172, 10);
+    B.box('polymer', 0.012, 0.14, 0.056, -0.037, -0.15 + o, 0.12);
+    for (let i = 0; i < 4; i++) {
+      const y = -0.2 + i * 0.033 + o;
+      B.cylZ('shell', 0.0118, 0.062, -0.05, y, 0.118, 10);
+      B.cylZ('brass', 0.0125, 0.016, -0.05, y, 0.155, 10);
+    }
+    // barrel with vent rib + bead, magazine tube, clamp, cap
+    B.cyl('dark', 0.0195, 0.0195, 0.54, 0, -0.57 + o, bz, 16);
+    B.cyl('steel', 0.021, 0.021, 0.012, 0, -0.836 + o, bz, 16);
+    B.disc('bore', 0.014, 0, -0.8425 + o, bz, -1, 14);
+    B.box('dark', 0.012, 0.52, 0.005, 0, -0.565 + o, bz + 0.03);
+    for (let i = 0; i < 9; i++) B.box('dark', 0.006, 0.006, 0.012, 0, -0.33 - i * 0.062 + o, bz + 0.022);
+    B.sphere('brass', 0.0055, 0, -0.82 + o, bz + 0.037, 8);
+    B.cyl('dark', 0.017, 0.017, 0.48, 0, -0.54 + o, 0.095, 14);
+    B.cyl('steel', 0.02, 0.02, 0.028, 0, -0.792 + o, 0.095, 14);
+    B.box('steel', 0.044, 0.024, 0.07, 0, -0.75 + o, 0.118);
+    B.ring('dark', 0.012, 0.003, 0, -0.792 + o, 0.068, 0, Math.PI / 2, 0);
+    // ribbed wooden pump + action bars
+    const pump = [];
+    for (let i = 0; i <= 10; i++) { const yy = -0.11 + i * 0.022; pump.push([i % 2 ? 0.0335 : 0.0365, yy]); if (i < 10) pump.push([i % 2 ? 0.0365 : 0.0335, yy + 0.003]); }
+    pump.unshift([0.02, -0.114]); pump.push([0.02, 0.114]);
+    B.lathe('wood', pump, 0, -0.5 + o, 0.096, 16);
+    for (const s of [-1, 1]) B.box('dark', 0.004, 0.13, 0.01, s * 0.022, -0.34 + o, 0.088);
+    // trigger group
+    B.guard('steel', 0.042, 0.006, -0.045 + o, 0.075, 1, 0.8);
+    B.box('dark', 0.008, 0.01, 0.036, 0, -0.04 + o, 0.055, -0.3);
+    B.box('steel', 0.03, 0.12, 0.012, 0, -0.07 + o, 0.068);
+    // sporter stock with pistol grip, rubber pad, sling stud
+    B.ext('wood', [[-0.03, 0.162], [0.355, 0.112], [0.36, -0.06], [0.34, -0.066], [0.2, 0.03, 0.115, 0.05], [0.092, 0.045], [0.084, -0.02, 0.074, -0.11], [0.066, -0.128], [0.018, -0.128],
+      [0.0, -0.11], [-0.008, -0.05, -0.024, 0.0], [-0.03, 0.04, -0.03, 0.075]], 0.054, 0, 0.007);
+    B.box('polymer', 0.06, 0.022, 0.186, 0, 0.368, 0.025, 0.03);
+    B.ring('dark', 0.011, 0.003, 0, 0.29, -0.052, 0, Math.PI / 2, 0);
+    return [0, -0.85 + o, bz];
+  },
+
+  tactico(B) {
+    const bz = 0.125;
+    // upper + lower receivers (tan) with forward assist, port cover, charging handle
+    B.ext('tan', [[0.048, 0.1], [0.048, 0.162], [-0.27, 0.162], [-0.27, 0.1]], 0.056, 0, 0.005);
+    B.ext('tan', [[0.045, 0.1], [-0.215, 0.1], [-0.215, 0.07], [-0.205, 0.012], [-0.092, 0.012], [-0.088, 0.064], [0.03, 0.064], [0.045, 0.08]], 0.054, 0, 0.005);
+    B.cyl('tan', 0.011, 0.011, 0.05, 0.03, 0.005, 0.14, 10, 0.12);
+    B.box('dark', 0.008, 0.085, 0.032, 0.0295, -0.085, 0.132);
+    B.box('dark', 0.05, 0.022, 0.012, 0, 0.055, 0.156);
+    B.box('dark', 0.004, 0.03, 0.022, 0.028, -0.01, 0.085);         // selector
+    // top rail with teeth along the whole upper
+    B.box('dark', 0.032, 0.66, 0.012, 0, -0.29, 0.174);
+    const teeth = isTouch ? 22 : 33;
+    for (let i = 0; i < teeth; i++) B.box('dark', 0.035, 0.0105, 0.007, 0, 0.032 - i * (0.65 / teeth), 0.1835);
+    // octagonal handguard with slot cut-outs, front cap, hand stop
+    B.cyl('tan', 0.044, 0.044, 0.36, 0, -0.44, bz, 8, 0, Math.PI / 8, 0);
+    for (let i = 0; i < 4; i++) for (const s of [-1, 1]) {
+      B.box('bore', 0.002, 0.045, 0.012, s * 0.0408, -0.33 - i * 0.075, bz);
+      B.box('bore', 0.002, 0.045, 0.01, s * 0.0289, -0.33 - i * 0.075, bz - 0.0289, 0, s * Math.PI / 4);
+    }
+    B.cyl('dark', 0.041, 0.041, 0.014, 0, -0.622, bz, 8, 0, Math.PI / 8, 0);
+    B.ext('polymer', [[-0.47, 0.09], [-0.56, 0.09], [-0.54, 0.045], [-0.49, 0.05]], 0.03, 0, 0.004);
+    // barrel + slotted muzzle device
+    B.cyl('dark', 0.0135, 0.0135, 0.2, 0, -0.72, bz, 12);
+    B.cyl('dark', 0.02, 0.019, 0.07, 0, -0.84, bz, 14);
+    for (let i = 0; i < 3; i++) { B.box('bore', 0.042, 0.008, 0.01, 0, -0.822 - i * 0.017, bz); B.box('bore', 0.009, 0.008, 0.042, 0, -0.822 - i * 0.017, bz); }
+    B.disc('bore', 0.009, 0, -0.8755, bz, -1, 12);
+    // flip-up sights
+    B.box('dark', 0.03, 0.018, 0.03, 0, -0.6, 0.195);
+    B.box('dark', 0.004, 0.006, 0.026, 0, -0.6, 0.218);
+    B.box('dark', 0.032, 0.018, 0.024, 0, 0.022, 0.192);
+    B.ring('dark', 0.008, 0.0025, 0, 0.022, 0.21, Math.PI / 2, 0, 0);
+    // red-dot optic: mount, tube, lens hood, turrets, glowing lens
+    B.box('polymer', 0.034, 0.05, 0.02, 0, -0.12, 0.195);
+    B.cyl('polymer', 0.026, 0.026, 0.072, 0, -0.12, 0.228, 16);
+    B.cyl('polymer', 0.028, 0.03, 0.016, 0, -0.163, 0.228, 16);
+    B.cyl('polymer', 0.028, 0.028, 0.01, 0, -0.08, 0.228, 16);
+    B.cylZ('polymer', 0.009, 0.014, 0, -0.12, 0.258, 10);
+    B.cylX('polymer', 0.009, 0.014, 0.031, -0.12, 0.228, 10);
+    B.disc('lens', 0.023, 0, -0.0745, 0.228, 1, 18);
+    B.disc('lens', 0.024, 0, -0.1715, 0.228, -1, 18);
+    // polymer grip, trigger guard, trigger
+    B.ext('polymer', wv2GripPath(0.072), 0.042, 0, 0.006);
+    B.box('tan', 0.022, 0.09, 0.008, 0, -0.047, 0.016);
+    B.box('tan', 0.016, 0.012, 0.05, 0, -0.088, 0.04);
+    B.box('dark', 0.008, 0.01, 0.034, 0, -0.06, 0.045, -0.3);
+    // straight polymer magazine with ribs + base plate
+    B.ext('polymer', [[-0.098, 0.03], [-0.198, 0.03], [-0.214, -0.205], [-0.112, -0.21]], 0.046, 0, 0.005);
+    for (const s of [-1, 1]) for (let i = 0; i < 2; i++) B.box('polymer', 0.004, 0.008, 0.2, s * 0.025, -0.13 - i * 0.04, -0.09, -0.06);
+    B.box('polymer', 0.054, 0.112, 0.016, 0, -0.163, -0.214, -0.04);
+    // buffer tube, castle nut, adjustable stock (tan) + pad (black), sling socket
+    B.cyl('dark', 0.019, 0.019, 0.24, 0, 0.17, bz, 12);
+    B.cyl('dark', 0.025, 0.025, 0.014, 0, 0.056, bz, 10);
+    B.ext('tan', [[0.12, 0.155], [0.31, 0.168], [0.318, 0.004], [0.3, -0.004], [0.22, 0.05, 0.14, 0.096], [0.12, 0.1]], 0.05, 0, 0.006);
+    B.box('polymer', 0.056, 0.02, 0.18, 0, 0.326, 0.083);
+    B.box('polymer', 0.046, 0.15, 0.008, 0, 0.225, 0.171, 0.068);   // cheek riser
+    B.box('bore', 0.0502, 0.085, 0.03, 0, 0.245, 0.072);             // lightening cut-out
+    B.cylX('dark', 0.009, 0.06, 0, 0.26, 0.03, 10);
+    B.ring('dark', 0.011, 0.0028, -0.033, 0.18, 0.08, 0, Math.PI / 2, 0);
+    return [0, -0.88, bz];
+  },
+
+  cohetes(B) {
+    const tz = 0.16, R = 0.11;
+    // main tube (stencilled olive) + front collar + dark interior + rear venturi bell
+    B.cyl('olive', R, R, 1.1, 0, -0.23, tz, 22, 0, 0, 0, 1, 1, false, { su: 1, sv: 1 });
+    B.cyl('polymer', 0.124, 0.122, 0.075, 0, -0.765, tz, 20);
+    B.disc('bore', 0.104, 0, -0.8035, tz, -1, 20);
+    B.lathe('dark', [[0.1135, 0.27], [0.118, 0.33], [0.132, 0.4], [0.142, 0.44], [0.132, 0.446], [0.112, 0.4], [0.1, 0.33]], 0, 0, tz, 22);
+    B.disc('bore', 0.1, 0, 0.335, tz, 1, 18);
+    for (const y of [-0.52, 0.12]) B.cyl('dark', 0.115, 0.115, 0.028, 0, y, tz, 20);
+    // warhead poking out of the muzzle
+    B.lathe('warhead', [[0.0, -1.0], [0.022, -0.995], [0.05, -0.97], [0.074, -0.92], [0.088, -0.86], [0.09, -0.82], [0.078, -0.8]], 0, 0, tz, 18);
+    B.lathe('brass', [[0, -1.05], [0.01, -1.045], [0.016, -1.02], [0.024, -0.998], [0.022, -0.99]], 0, 0, tz, 12);
+    B.cyl('paint', 0.0912, 0.0912, 0.012, 0, -0.85, tz, 18);
+    // optic box on the left with lens + hood, iron sights on top
+    B.box('dark', 0.034, 0.07, 0.05, -0.062, -0.16, 0.258);
+    B.ext('polymer', [[-0.07, 0.28], [-0.24, 0.28], [-0.25, 0.3], [-0.25, 0.335], [-0.07, 0.335]], 0.055, -0.08, 0.006);
+    B.box('polymer', 0.06, 0.03, 0.008, -0.08, -0.255, 0.344);
+    B.disc('lens', 0.021, -0.08, -0.064, 0.3075, 1, 16);
+    B.disc('lens', 0.021, -0.08, -0.2565, 0.3075, -1, 16);
+    B.box('dark', 0.026, 0.012, 0.04, 0, -0.68, tz + R + 0.012);
+    B.box('dark', 0.034, 0.014, 0.026, 0, 0.04, tz + R + 0.006);
+    // fire-control housing, grip, trigger guard, fore-grip, shoulder pad
+    B.ext('od', [[0.06, 0.068], [-0.13, 0.068], [-0.12, 0.03], [0.05, 0.03]], 0.05, 0, 0.005);
+    B.ext('polymer', wv2GripPath(0.04), 0.044, 0, 0.006);
+    B.guard('dark', 0.036, 0.005, -0.075, 0.032, 1, 0.8);
+    B.box('dark', 0.008, 0.01, 0.03, 0, -0.07, 0.018, -0.3);
+    B.box('od', 0.04, 0.06, 0.03, 0, -0.42, 0.062);
+    B.cyl('polymer', 0.024, 0.021, 0.12, 0, -0.42, -0.01, 12, Math.PI / 2);
+    B.cyl('polymer', 0.026, 0.026, 0.014, 0, -0.42, -0.07, 12, Math.PI / 2);
+    B.ext('polymer', [[0.12, 0.07], [0.3, 0.07], [0.3, 0.035], [0.28, 0.012, 0.25, 0.012], [0.14, 0.012], [0.12, 0.02]], 0.07, 0, 0.008);
+    B.ring('dark', 0.014, 0.0035, -0.125, -0.52, tz, 0, Math.PI / 2, 0);
+    return [0, -1.05, tz];
+  },
+
+  bate(B) {
+    const prof = [[0.0, -0.968], [0.032, -0.964], [0.054, -0.952], [0.064, -0.932], [0.068, -0.9], [0.068, -0.8], [0.066, -0.7], [0.06, -0.6], [0.05, -0.5], [0.04, -0.4], [0.032, -0.3],
+      [0.028, -0.2], [0.026, -0.1], [0.026, 0.03], [0.029, 0.05], [0.04, 0.062], [0.048, 0.072], [0.048, 0.086], [0.032, 0.094], [0.0, 0.096]];
+    B.lathe('batWood', prof, 0, 0, 0, 20);
+    // spiral grip tape over the handle (one helical turn every ~0.03)
+    const g = [[0.0315, -0.25], [0.0305, -0.2], [0.0285, -0.1], [0.0285, 0.035]];
+    B.lathe('tape', g, 0, 0, 0, 16, 0, 0, 0, { su: 1, sv: 9.5 });
+    B.cyl('tape', 0.031, 0.033, 0.012, 0, -0.25, 0, 16);
+    // painted bands near the barrel end
+    B.cyl('paint', 0.0688, 0.0688, 0.024, 0, -0.83, 0, 20, 0, 0, 0, 1, 1, true);
+    B.cyl('paint', 0.0688, 0.0688, 0.008, 0, -0.865, 0, 20, 0, 0, 0, 1, 1, true);
+    return null;
+  }
+};
+
+function wv2Get(id) {
+  if (wv2Parts[id]) return wv2Parts[id];
+  const fn = wv2Build[id]; if (!fn) return null;
+  const B = wv2Builder();
+  const muzzle = fn(B);
+  return wv2Parts[id] = { parts: B.done('wv2_' + id + '_'), muzzle: muzzle ? new THREE.Vector3(muzzle[0], muzzle[1], muzzle[2]) : null };
+}
+
 function weaponModel(id) {
   const g = new THREE.Group();
-  const bx = (w, l, h, mat, y, z, rx = 0) => { const m = new THREE.Mesh(new THREE.BoxGeometry(w, l, h), mat); m.position.set(0, y, z); m.rotation.x = rx; m.castShadow = true; g.add(m); return m; };
-  const cy = (r1, r2, l, mat, y, z) => { const m = new THREE.Mesh(new THREE.CylinderGeometry(r1, r2, l, 10), mat); m.position.set(0, y, z); m.castShadow = true; g.add(m); return m; };
-  if (id === 'pistola') { bx(0.06, 0.3, 0.08, gunMetal, -0.1, 0.12); bx(0.055, 0.09, 0.2, gunMetal, 0.02, 0.02, -0.2); cy(0.015, 0.015, 0.06, gunMetal, -0.27, 0.13); }
-  else if (id === 'ak') { bx(0.07, 0.5, 0.12, gunMetal, -0.12, 0.1); bx(0.075, 0.24, 0.1, gunWood, -0.47, 0.09); cy(0.018, 0.018, 0.36, gunMetal, -0.72, 0.12); bx(0.06, 0.34, 0.12, gunWood, 0.28, 0.06); bx(0.05, 0.08, 0.22, gunMetal, -0.2, -0.05, 0.35); bx(0.05, 0.1, 0.06, gunWood, 0.02, 0.0); }
-  else if (id === 'tactico') { bx(0.075, 0.6, 0.13, gunTan, -0.18, 0.1); cy(0.02, 0.02, 0.32, gunMetal, -0.64, 0.12); bx(0.05, 0.2, 0.07, gunMetal, -0.15, 0.22); bx(0.05, 0.07, 0.2, gunMetal, -0.2, -0.05); bx(0.06, 0.3, 0.14, gunMetal, 0.25, 0.06); }
-  else if (id === 'escopeta') { cy(0.032, 0.032, 0.85, gunMetal, -0.42, 0.13); cy(0.025, 0.025, 0.6, gunMetal, -0.32, 0.07); bx(0.075, 0.2, 0.09, gunWood, -0.48, 0.07); bx(0.07, 0.22, 0.13, gunMetal, -0.02, 0.1); bx(0.06, 0.36, 0.13, gunWood, 0.25, 0.05); }
-  else if (id === 'cohetes') { cy(0.11, 0.11, 1.25, rocketMat, -0.25, 0.16); const tip = new THREE.Mesh(new THREE.ConeGeometry(0.1, 0.25, 10), rocketTip); tip.position.set(0, -0.95, 0.16); tip.rotation.x = Math.PI; g.add(tip); bx(0.06, 0.1, 0.18, gunMetal, 0.0, 0.02); }
-  else if (id === 'bate') { cy(0.035, 0.075, 1.0, batWood, -0.47, 0); const k = new THREE.Mesh(new THREE.SphereGeometry(0.045, 8, 6), batWood); k.position.y = 0.06; g.add(k); }
+  const d = wv2Get(id); if (!d) return g;
+  for (const [k, geo] of d.parts) {
+    const m = new THREE.Mesh(geo, weaponMats[k]);
+    m.castShadow = k !== 'bore' && k !== 'tritium' && k !== 'lens';
+    g.add(m);
+  }
+  g.name = 'weapon_' + id;
+  if (d.muzzle) g.userData.muzzle = d.muzzle.clone(); // local muzzle tip (for flashes)
   return g;
 }
 
+// flying rocket: nose toward +Y, fins + exhaust glow toward -Y (centre of mass at the origin)
+function rocketModel() {
+  if (!wv2Parts.__rocket) {
+    const B = wv2Builder();
+    B.cyl('od', 0.062, 0.062, 0.36, 0, -0.06, 0, 16);
+    B.lathe('warhead', [[0.064, 0.12], [0.072, 0.15], [0.07, 0.2], [0.056, 0.26], [0.032, 0.31], [0.02, 0.325]], 0, 0, 0, 16);
+    B.lathe('brass', [[0.021, 0.322], [0.016, 0.34], [0.008, 0.352], [0, 0.355]], 0, 0, 0, 10);
+    B.cyl('paint', 0.0635, 0.0635, 0.014, 0, 0.09, 0, 16);
+    B.cyl('dark', 0.05, 0.04, 0.05, 0, -0.26, 0, 12);
+    for (let i = 0; i < 4; i++) { const a = i * Math.PI / 2 + Math.PI / 4; B.box('dark', 0.006, 0.12, 0.06, Math.cos(a) * 0.085, -0.19, Math.sin(a) * 0.085, 0, Math.PI / 2 - a, 0); }
+    wv2Parts.__rocket = B.done('wv2_rocket_');
+  }
+  const g = new THREE.Group(); g.name = 'rocket';
+  for (const [k, geo] of wv2Parts.__rocket) { const m = new THREE.Mesh(geo, weaponMats[k]); m.castShadow = true; g.add(m); }
+  const fl = new THREE.Mesh(G('wv2_flame', () => new THREE.ConeGeometry(0.06, 0.3, 10, 1, true)), weaponMats.flame);
+  fl.rotation.x = Math.PI; fl.position.y = -0.435; g.add(fl);
+  const core = new THREE.Mesh(G('wv2_flameCore', () => new THREE.ConeGeometry(0.032, 0.17, 8, 1, true)), weaponMats.flameCore);
+  core.rotation.x = Math.PI; core.position.y = -0.37; g.add(core);
+  const glow = new THREE.Sprite(weaponMats.glow); glow.scale.set(0.55, 0.55, 1); glow.position.y = -0.33; g.add(glow);
+  g.userData.flame = fl; g.userData.glow = glow;
+  return g;
+}
+// =================== end weapons_v2 ===================
+const gunMetal = weaponMats.dark, rocketMat = weaponMats.od;
+
 // ---------- personajes: muñecos redondeados con ojos saltones (diseño propio) ----------
 const SEG = isTouch ? 12 : 18;
-const eyeW = std({ color: 0xffffff, roughness: 0.25 }), eyeB = std({ color: 0x111018, roughness: 0.2 }), mouthMat = std({ color: 0x3a1420, roughness: 0.6 });
-const SKINS = [0xf1c7a8, 0xe8b392, 0xd59a76, 0xc0835c, 0x9a6444, 0x7a4b32, 0x5c3a27, 0xf5d0c0];
-const SHIRTS = [0xff4f7b, 0x4fd1c5, 0xffc94f, 0x7a6cff, 0xf2f2f2, 0x2b2b35, 0xff8a3d, 0x6bd66b, 0x3da5ff, 0xc77dff];
-const PANTS = [0x2b2b35, 0x3b4a6b, 0x6b5a4a, 0x1f2a44, 0x8a8a96, 0x5a2b44, 0x2f4f3f];
-const HATS = ['beanie', 'cap', 'phones', 'bun', 'puff', 'none', 'beanie', 'cap'];
-function randomLook() {
-  return { skin: pick(SKINS), shirt: pick(SHIRTS), sleeve: Math.random() < 0.35 ? pick([0x2b2b35, 0xf2f2f2, 0x1f2a44]) : null, short: Math.random() < 0.6, pants: pick(PANTS), shorts: Math.random() < 0.45, shoes: pick([0xf2f2f2, 0x2b2b35, 0xff4f7b, 0x3da5ff, 0xffc94f]), hat: pick(HATS), hatColor: pick([0x2b2b35, 0xff4f7b, 0x3de8ff, 0xffc94f, 0x7a6cff, 0xe8e8f0, 0x6bd66b]), hair: pick([0x1b120e, 0x3b2416, 0x6b4426, 0xd9b26a, 0xe8e0d0, 0x8a2b2b]) };
+// ================= char_v2: personajes "vinyl toy" redondeados (diseño original) =================
+// Requiere en el ámbito: THREE, std, G, pick, NEON, isTouch, SEG.
+// Todo lo propio va con prefijo cv2 / CV2 para no chocar con el resto del juego.
+// makeGuy(look) -> { root, body, torso, head, arms, elbows, legs, knees, pupils, weaponSlot, umb, mats }
+//   pivotes: body y=1.06 | torso y=0.06 | head y=0.92 | hombros (∓0.38,0.66) | codos y=-0.42 | mano y=-0.42
+//            caderas (∓0.15,-0.05) | rodillas y=-0.48. weaponSlot cuelga de la mano derecha (x>0) sin rotar.
+//   pupils[i].userData.base = {x,y}: posición de reposo (en el grupo interno de la cabeza) para el bamboleo.
+// look: campos de siempre + opcionales: eyes, top('tee'|'hoodie'), hairStyle('quiff'|'spikes'|'buzz'),
+//   mouth(0-4), brow(0-3), lid(0-2), lashes, freckles, print(-1|0-5), printColor, trim, capBack, glow.
+// Los colores del look se interpretan como sRGB (se pasan a lineal) para que se vean saturados.
+const CV2 = { tex: {}, mat: {}, T: null, torso: null };
+const CV2H = { yc: 0.345, a: 0.315, b: 0.292, n: 2.35, dz: 0.93 }; // cabeza: superelipse (espacio del grupo head)
+const CV2E = { x: 0.118, y: 0.318, r: 0.1, sx: 0.92, sy: 1.15, sz: 0.5 }; // ojos
+const CV2TZ = 0.72; // profundidad relativa del torso
+const CV2_FIX = [0.5, 0.995]; // uv fija (zona lisa del mapa de cara)
+const CV2_LIDUV = [0.03, 0.03]; // muestra de tono de párpado en el mapa de cara
+const cv2S = n => Math.max(6, Math.round(n * SEG / 18));
+const cv2Cl = (v, a, b) => v < a ? a : v > b ? b : v;
+const cv2Sm = (e0, e1, x) => { const t = cv2Cl((x - e0) / (e1 - e0), 0, 1); return t * t * (3 - 2 * t); };
+const cv2P = (s, p) => Math.sign(s) * Math.pow(Math.abs(s), p);
+const cv2V = (x = 0, y = 0, z = 0) => new THREE.Vector3(x, y, z);
+const cv2Mix = (a, b, t) => new THREE.Color(a).lerp(new THREE.Color(b), t).getHex();
+const cv2Lum = h => { const c = new THREE.Color(h); return 0.3 * c.r + 0.59 * c.g + 0.11 * c.b; };
+const cv2Css = (h, al = 1) => { const c = new THREE.Color(h); return `rgba(${Math.round(c.r * 255)},${Math.round(c.g * 255)},${Math.round(c.b * 255)},${al})`; };
+function cv2Rng(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+function cv2Noise(per, seed) { // ruido de valor periódico (tileable)
+  const r = cv2Rng(seed), g = new Float32Array(per * per); for (let i = 0; i < g.length; i++) g[i] = r();
+  const at = (x, y) => g[((y % per + per) % per) * per + ((x % per + per) % per)];
+  return (u, v) => {
+    const x0 = Math.floor(u), y0 = Math.floor(v); let fx = u - x0, fy = v - y0; fx = fx * fx * (3 - 2 * fx); fy = fy * fy * (3 - 2 * fy);
+    return (at(x0, y0) * (1 - fx) + at(x0 + 1, y0) * fx) * (1 - fy) + (at(x0, y0 + 1) * (1 - fx) + at(x0 + 1, y0 + 1) * fx) * fy;
+  };
 }
+
+// ---------- texturas procedurales (cache de módulo) ----------
+function cv2Canvas(key, w, h, draw, srgb = true) {
+  if (CV2.tex[key]) return CV2.tex[key];
+  const c = document.createElement('canvas'); c.width = w; c.height = h; draw(c.getContext('2d'), w, h);
+  const t = new THREE.CanvasTexture(c); if (srgb) t.encoding = THREE.sRGBEncoding;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = 4;
+  return CV2.tex[key] = t;
+}
+// campo escalar -> mapa de normales (str > 0, lineal) o mapa gris (str = 0, lineal; p.ej. roughness)
+function cv2Field(key, w, h, fn, str) {
+  if (CV2.tex[key]) return CV2.tex[key];
+  const hf = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) hf[y * w + x] = fn(x, y);
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const ctx = c.getContext('2d'), img = ctx.createImageData(w, h), d = img.data;
+  const H = (x, y) => hf[((y + h) % h) * w + ((x + w) % w)];
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = (y * w + x) * 4;
+    if (str > 0) {
+      const nx = -(H(x + 1, y) - H(x - 1, y)) * str, ny = (H(x, y + 1) - H(x, y - 1)) * str, l = Math.hypot(nx, ny, 1);
+      d[i] = (nx / l * 0.5 + 0.5) * 255; d[i + 1] = (ny / l * 0.5 + 0.5) * 255; d[i + 2] = (0.5 / l + 0.5) * 255;
+    } else d[i] = d[i + 1] = d[i + 2] = cv2Cl(hf[y * w + x], 0, 1) * 255;
+    d[i + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = 4;
+  return CV2.tex[key] = t;
+}
+function cv2SeamH(d, along) { // costura: surco + vivo + puntadas
+  const q = (v, s) => Math.exp(-(v / s) * (v / s));
+  return -0.75 * q(d, 1.3) + 0.32 * q(d - 3.4, 1.5) + ((along % 6) < 3.5 ? 0.6 * q(d - 6, 0.8) : 0);
+}
+function cv2Twill(key, seamsU, seamsV, period, str) {
+  const n = cv2Noise(16, 9), W = 256, H = 128;
+  return cv2Field(key, W, H, (x, y) => {
+    let h = 0.2 * Math.sin(2 * Math.PI * (x + y) / period) + 0.3 * n(x / 16, y / 8);
+    for (const su of seamsU) { let d = Math.abs(x - su * W); d = Math.min(d, W - d); h += cv2SeamH(d, y); }
+    for (const sv of seamsV) { let d = Math.abs(y - (1 - sv) * H); d = Math.min(d, H - d); h += cv2SeamH(d, x); }
+    return h;
+  }, str);
+}
+function cv2T() {
+  if (CV2.T) return CV2.T;
+  const T = CV2.T = {};
+  const n32 = cv2Noise(32, 3);
+  T.jersey = cv2Field('cv2jersey', 128, 128, (x, y) => { // punto de camiseta
+    const col = x >> 2, cx = (x & 3) / 4 + 0.125, off = (col & 1) * 2;
+    return 0.34 * Math.sin(Math.PI * cx) * (0.6 + 0.4 * Math.sin(Math.PI * 2 * (y + off) / 4)) + 0.3 * n32(x / 4, y / 4);
+  }, 2.2);
+  T.denim = cv2Twill('cv2denim', [0.25, 0.75], [], 5, 2.4); // sarga + costuras laterales
+  T.cap = cv2Twill('cv2cap', [0, 1 / 6, 2 / 6, 3 / 6, 4 / 6, 5 / 6], [], 4, 2.2); // gorra de 6 paneles
+  const n16 = cv2Noise(16, 5);
+  T.knit = cv2Field('cv2knit', 128, 64, (x, y) => { // canalé de lana
+    const rx = (x % 8) / 8, rib = 0.5 - 0.5 * Math.cos(2 * Math.PI * rx);
+    return 0.7 * rib + 0.14 * rib * Math.sin(2 * Math.PI * (y / 4 + Math.abs(rx - 0.5) * 0.9)) + 0.1 * n16(x / 8, y / 4);
+  }, 3.2);
+  const ks = [[6, 1, 0.3], [11, 2, 1.7], [17, 1, 2.9], [27, 2, 4.1], [39, 3, 0.7], [57, 1, 5.3], [83, 2, 2.2]];
+  T.strands = cv2Field('cv2strands', 128, 128, (x, y) => { // mechones de pelo
+    let h = 0; for (const [f, m, p] of ks) h += Math.sin(2 * Math.PI * f * (x + 3 * Math.sin(2 * Math.PI * m * y / 128 + p)) / 128 + p * 3) / Math.sqrt(f);
+    return 0.42 * h;
+  }, 3.2);
+  const r = cv2Rng(21), pts = []; for (let i = 0; i < 56; i++) pts.push([r() * 128, r() * 128, 7 + r() * 8]);
+  T.curly = cv2Field('cv2curly', 128, 128, (x, y) => { // rizos
+    let h = 0; for (const p of pts) { let dx = Math.abs(x - p[0]); dx = Math.min(dx, 128 - dx); let dy = Math.abs(y - p[1]); dy = Math.min(dy, 128 - dy); const q = (dx * dx + dy * dy) / (p[2] * p[2]); if (q < 1) h = Math.max(h, Math.sqrt(1 - q)); }
+    return h * 0.85;
+  }, 3);
+  const n8 = cv2Noise(8, 31), n32b = cv2Noise(32, 37);
+  T.skinR = cv2Field('cv2skinR', 128, 128, (x, y) => 0.4 + 0.14 * n8(x / 16, y / 16) + 0.1 * n32b(x / 4, y / 4), 0);
+  T.face = [cv2FaceTex(false), cv2FaceTex(true)];
+  T.hi = cv2Canvas('cv2irisHi', 128, 128, (x, w) => { // brillos especulares del ojo (emisivo)
+    x.fillStyle = '#000'; x.fillRect(0, 0, w, w); x.fillStyle = '#fff';
+    x.beginPath(); x.ellipse(w / 2 - 21, w / 2 - 22, 15, 11, -0.6, 0, 7); x.fill();
+    x.beginPath(); x.arc(w / 2 + 22, w / 2 + 21, 6.5, 0, 7); x.fill();
+  });
+  return T;
+}
+function cv2FaceTex(fr) { // mapa de color de la cara: blanco + rubor (+ pecas); se multiplica por el color de piel
+  return cv2Canvas('cv2face' + fr, 512, 256, (x, w, h) => {
+    x.fillStyle = '#fff'; x.fillRect(0, 0, w, h);
+    x.fillStyle = 'rgb(238,224,224)'; x.fillRect(0, h - 32, 32, 32); // tono de párpado
+    const yC = 0.205, v = (cv2ThOf(yC) + Math.PI / 2) / Math.PI, rr = cv2Rng(77);
+    for (const s of [-1, 1]) {
+      const rad = cv2HeadR(yC), u = 0.5 + Math.asin(cv2Cl(s * 0.17 / rad, -1, 1)) / (2 * Math.PI), cx = u * w, cy = (1 - v) * h;
+      x.save(); x.translate(cx, cy); x.scale(1, 0.62);
+      const g = x.createRadialGradient(0, 0, 0, 0, 0, 24); g.addColorStop(0, 'rgba(255,105,130,0.42)'); g.addColorStop(0.6, 'rgba(255,105,130,0.2)'); g.addColorStop(1, 'rgba(255,105,130,0)');
+      x.fillStyle = g; x.beginPath(); x.arc(0, 0, 24, 0, 7); x.fill(); x.restore();
+      if (fr) for (let i = 0; i < 9; i++) { x.fillStyle = 'rgba(120,60,40,0.55)'; x.beginPath(); x.ellipse(cx - s * 6 + (rr() - 0.5) * 30, cy - 9 + (rr() - 0.5) * 10, 1.9, 1.3, 0, 0, 7); x.fill(); }
+    }
+  });
+}
+function cv2IrisTex(col) {
+  return cv2Canvas('cv2iris' + col, 128, 128, (x, w) => {
+    const c = w / 2;
+    x.fillStyle = '#0c070e'; x.fillRect(0, 0, w, w);
+    const g = x.createRadialGradient(c, c + 8, 6, c, c, 63);
+    g.addColorStop(0, cv2Css(cv2Mix(col, 0xffffff, 0.5))); g.addColorStop(0.5, cv2Css(col)); g.addColorStop(0.86, cv2Css(cv2Mix(col, 0x000000, 0.5))); g.addColorStop(1, '#100810');
+    x.fillStyle = g; x.beginPath(); x.arc(c, c, 63, 0, 7); x.fill();
+    x.strokeStyle = cv2Css(cv2Mix(col, 0xffffff, 0.65), 0.28); x.lineWidth = 1.6;
+    for (let i = 0; i < 44; i++) { const a = i / 44 * Math.PI * 2; x.beginPath(); x.moveTo(c + Math.cos(a) * 31, c + Math.sin(a) * 31); x.lineTo(c + Math.cos(a) * 52, c + Math.sin(a) * 52); x.stroke(); }
+    x.fillStyle = '#060308'; x.beginPath(); x.arc(c, c, 30, 0, 7); x.fill();
+    x.fillStyle = '#fff'; x.beginPath(); x.ellipse(c - 21, c - 22, 15, 11, -0.6, 0, 7); x.fill();
+    x.beginPath(); x.arc(c + 22, c + 21, 6.5, 0, 7); x.fill();
+  });
+}
+const CV2_PRINTS = 6;
+function cv2PrintTex(k) { // estampados propios: rayo, estrella, diana, luna, triángulo, ondas
+  return cv2Canvas('cv2print' + k, 128, 128, (x, w) => {
+    x.clearRect(0, 0, w, w); x.fillStyle = '#fff'; x.strokeStyle = '#fff'; x.lineJoin = 'round'; x.lineCap = 'round';
+    const poly = p => { x.beginPath(); p.forEach((q, i) => i ? x.lineTo(q[0], q[1]) : x.moveTo(q[0], q[1])); x.closePath(); x.fill(); };
+    if (k === 0) poly([[72, 8], [30, 70], [58, 70], [46, 120], [98, 52], [68, 52], [84, 8]]);
+    else if (k === 1) { const p = []; for (let i = 0; i < 10; i++) { const a = -Math.PI / 2 + i * Math.PI / 5, rr = i % 2 ? 24 : 56; p.push([64 + Math.cos(a) * rr, 68 + Math.sin(a) * rr]); } poly(p); }
+    else if (k === 2) { x.lineWidth = 12; x.beginPath(); x.arc(64, 64, 46, 0, 7); x.stroke(); x.beginPath(); x.arc(64, 64, 18, 0, 7); x.fill(); }
+    else if (k === 3) { x.beginPath(); x.arc(64, 64, 52, 0, 7); x.fill(); x.globalCompositeOperation = 'destination-out'; x.beginPath(); x.arc(88, 48, 46, 0, 7); x.fill(); x.globalCompositeOperation = 'source-over'; }
+    else if (k === 4) { x.lineWidth = 12; x.beginPath(); x.moveTo(64, 14); x.lineTo(114, 106); x.lineTo(14, 106); x.closePath(); x.stroke(); x.beginPath(); x.arc(64, 76, 12, 0, 7); x.fill(); }
+    else { x.lineWidth = 11; for (let j = 0; j < 3; j++) { x.beginPath(); for (let i = 0; i <= 24; i++) { const px = 12 + i * 4.3, py = 34 + j * 30 + Math.sin(i / 24 * Math.PI * 3) * 10; i ? x.lineTo(px, py) : x.moveTo(px, py); } x.stroke(); } }
+  });
+}
+function cv2CanopyTex(col) { // gajos alternos + ribete
+  return cv2Canvas('cv2canopy' + col, 256, 64, (x, w, h) => {
+    const b = cv2Mix(col, 0xffffff, 0.6);
+    for (let i = 0; i < 8; i++) { x.fillStyle = cv2Css(i % 2 ? b : col); x.fillRect(i * w / 8, 0, w / 8 + 1, h); }
+    x.fillStyle = 'rgba(0,0,0,0.25)'; for (let i = 0; i < 8; i++) x.fillRect(i * w / 8 - 1, 0, 2, h);
+    x.fillStyle = 'rgba(255,255,255,0.85)'; x.fillRect(0, h - 9, w, 3);
+    x.fillStyle = 'rgba(0,0,0,0.18)'; x.fillRect(0, h - 4, w, 4);
+  });
+}
+
+// ---------- materiales compartidos (no parpadean al recibir daño) ----------
+function cv2Shared(k, f) { return CV2.mat[k] || (CV2.mat[k] = f()); }
+const cv2EyeWhite = () => cv2Shared('white', () => std({ color: 0xf7f4fa, roughness: 0.18, emissive: 0x1d1926 }));
+const cv2Feat = () => cv2Shared('feat', () => std({ color: 0xffffff, vertexColors: true, roughness: 0.4 }));
+const cv2Rubber = () => cv2Shared('rubber', () => std({ color: 0xf2f0f6, roughness: 0.55 }));
+const cv2Pad = () => cv2Shared('pad', () => std({ color: 0x1e1a28, roughness: 0.45 }));
+const cv2Metal = () => cv2Shared('metal', () => std({ color: 0xcfd1e6, roughness: 0.3, metalness: 0.5 }));
+const cv2Grip = () => cv2Shared('grip', () => std({ color: 0x2a1836, roughness: 0.4 }));
+const cv2Glow = c => cv2Shared('glow' + c, () => std({ color: 0x111111, emissive: c, emissiveIntensity: 1.6, roughness: 0.4 }));
+const cv2IrisMat = c => cv2Shared('iris' + c, () => std({ map: cv2IrisTex(c), emissive: 0xffffff, emissiveMap: cv2T().hi, emissiveIntensity: 0.9, roughness: 0.12 }));
+const cv2PrintMat = (k, c) => cv2Shared('print' + k + '_' + c, () => { const t = cv2PrintTex(k); return std({ color: c, map: t, emissive: c, emissiveMap: t, emissiveIntensity: 0.55, alphaTest: 0.5, roughness: 0.5 }); });
+const cv2CanopyMat = c => cv2Shared('canopy' + c, () => { const t = cv2CanopyTex(c); return std({ map: t, emissive: 0xffffff, emissiveMap: t, emissiveIntensity: 0.22, roughness: 0.55, side: THREE.DoubleSide }); });
+
+// ---------- utilidades de geometría ----------
+function cv2M(x = 0, y = 0, z = 0, rx = 0, ry = 0, rz = 0, sx = 1, sy = sx, sz = sx, order) {
+  return new THREE.Matrix4().compose(cv2V(x, y, z), new THREE.Quaternion().setFromEuler(new THREE.Euler(rx, ry, rz, order)), cv2V(sx, sy, sz));
+}
+// une varias geometrías (con su matriz) en una sola; uv escalable (uv:[su,sv]) o fija (fix:[u,v]); color de vértice opcional (c)
+function cv2Merge(parts) {
+  let nv = 0, ni = 0, col = false;
+  for (const p of parts) { const n = p.g.attributes.position.count; nv += n; ni += p.g.index ? p.g.index.count : n; if (p.c != null) col = true; }
+  const pos = new Float32Array(nv * 3), nor = new Float32Array(nv * 3), uv = new Float32Array(nv * 2), cl = col ? new Float32Array(nv * 3) : null;
+  const idx = nv > 65000 ? new Uint32Array(ni) : new Uint16Array(ni);
+  const v = new THREE.Vector3(), nm = new THREE.Matrix3(), cc = new THREE.Color(), I = new THREE.Matrix4();
+  let vo = 0, io = 0;
+  for (const p of parts) {
+    const g = p.g, P = g.attributes.position, N = g.attributes.normal, U = g.attributes.uv, m = p.m || I, n = P.count;
+    nm.getNormalMatrix(m); cc.setHex(p.c != null ? p.c : 0xffffff);
+    const su = p.uv ? p.uv[0] : 1, sv = p.uv ? p.uv[1] : 1;
+    for (let i = 0; i < n; i++) {
+      const k = vo + i;
+      v.fromBufferAttribute(P, i).applyMatrix4(m); pos[k * 3] = v.x; pos[k * 3 + 1] = v.y; pos[k * 3 + 2] = v.z;
+      v.fromBufferAttribute(N, i).applyMatrix3(nm).normalize(); nor[k * 3] = v.x; nor[k * 3 + 1] = v.y; nor[k * 3 + 2] = v.z;
+      if (p.fix) { uv[k * 2] = p.fix[0]; uv[k * 2 + 1] = p.fix[1]; } else if (U) { uv[k * 2] = U.getX(i) * su; uv[k * 2 + 1] = U.getY(i) * sv; }
+      if (cl) { cl[k * 3] = cc.r; cl[k * 3 + 1] = cc.g; cl[k * 3 + 2] = cc.b; }
+    }
+    const f = m.determinant() < 0;
+    if (g.index) { const X = g.index.array; for (let i = 0; i < X.length; i += 3) { idx[io + i] = X[i] + vo; idx[io + i + 1] = X[f ? i + 2 : i + 1] + vo; idx[io + i + 2] = X[f ? i + 1 : i + 2] + vo; } io += X.length; }
+    else { for (let i = 0; i < n; i += 3) { idx[io + i] = vo + i; idx[io + i + 1] = vo + (f ? i + 2 : i + 1); idx[io + i + 2] = vo + (f ? i + 1 : i + 2); } io += n; }
+    vo += n;
+  }
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.BufferAttribute(pos, 3)); out.setAttribute('normal', new THREE.BufferAttribute(nor, 3)); out.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  if (cl) out.setAttribute('color', new THREE.BufferAttribute(cl, 3));
+  out.setIndex(new THREE.BufferAttribute(idx, 1)); out.computeBoundingSphere();
+  return out;
+}
+// superficie paramétrica en rejilla (u alrededor, v hacia arriba); wrap = costura suave; poles = filas colapsadas
+function cv2Grid(nu, nv, fn, o = {}) {
+  const pos = [], uv = [], idx = [];
+  for (let j = 0; j <= nv; j++) for (let i = 0; i <= nu; i++) { const p = fn(i / nu, j / nv, i, j); pos.push(p[0], p[1], p[2]); uv.push(i / nu, j / nv); }
+  for (let j = 0; j < nv; j++) for (let i = 0; i < nu; i++) { const a = j * (nu + 1) + i, b = a + 1, c = a + nu + 2, d = a + nu + 1; idx.push(a, b, c, a, c, d); }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2)); g.setIndex(idx);
+  g.computeVertexNormals();
+  const N = g.attributes.normal, t = new THREE.Vector3();
+  if (o.wrap) for (let j = 0; j <= nv; j++) { const a = j * (nu + 1), b = a + nu; t.set(N.getX(a) + N.getX(b), N.getY(a) + N.getY(b), N.getZ(a) + N.getZ(b)).normalize(); N.setXYZ(a, t.x, t.y, t.z); N.setXYZ(b, t.x, t.y, t.z); }
+  for (const j of (o.poles || [])) { t.set(0, 0, 0); for (let i = 0; i <= nu; i++) { const k = j * (nu + 1) + i; t.x += N.getX(k); t.y += N.getY(k); t.z += N.getZ(k); } t.normalize(); for (let i = 0; i <= nu; i++) N.setXYZ(j * (nu + 1) + i, t.x, t.y, t.z); }
+  return g;
+}
+function cv2Lathe(pts, segs, zs = 1) { // pts [[r,y]] de abajo arriba; costura detrás (u=0.5 delante)
+  const g = new THREE.LatheGeometry(pts.map(p => new THREE.Vector2(Math.max(0, p[0]), p[1])), segs, -Math.PI, Math.PI * 2);
+  if (zs !== 1) g.scale(1, 1, zs);
+  return g;
+}
+function cv2CapPts(r1, r2, len, k) { // cápsula: semiesfera r1 centrada en y=0, semiesfera r2 en y=-len
+  const p = [];
+  for (let i = 0; i <= k; i++) { const a = -Math.PI / 2 + i / k * Math.PI / 2; p.push([r2 * Math.cos(a), -len + r2 * Math.sin(a)]); }
+  for (let i = 0; i <= k; i++) { const a = i / k * Math.PI / 2; p.push([r1 * Math.cos(a), r1 * Math.sin(a)]); }
+  return p;
+}
+const cv2Capsule = (r1, r2, len, segs = cv2S(14)) => cv2Lathe(cv2CapPts(r1, r2, len, isTouch ? 3 : 5), segs);
+function cv2Ring(r, tube, y, zs = 1, segs = cv2S(22)) { const g = new THREE.TorusGeometry(r, tube, 6, segs); g.rotateX(Math.PI / 2); g.scale(1, 1, zs); g.translate(0, y, 0); return g; }
+
+// ---------- cabeza ----------
+function cv2HeadR(y) {
+  const t = (y - CV2H.yc) / CV2H.a; if (t <= -1 || t >= 1) return 0;
+  let r = CV2H.b * Math.pow(1 - Math.pow(Math.abs(t), CV2H.n), 1 / CV2H.n);
+  r *= 1 + 0.04 * t; if (t < 0) r *= 1 - 0.12 * t * t;
+  return r;
+}
+function cv2ThOf(y) { const t = cv2Cl((y - CV2H.yc) / CV2H.a, -0.9999, 0.9999); return Math.asin(cv2P(t, CV2H.n / 2)); }
+function cv2HeadTh(th) { const y = CV2H.yc + CV2H.a * cv2P(Math.sin(th), 2 / CV2H.n); return [cv2HeadR(y), y]; }
+function cv2FaceZ(x, y) { const r = cv2HeadR(y); return CV2H.dz * Math.sqrt(Math.max(0, r * r - x * x)); }
+function cv2EyeXf(s) {
+  const x = s * CV2E.x, y = CV2E.y, e = 0.004;
+  const gx = (cv2FaceZ(x + e, y) - cv2FaceZ(x - e, y)) / (2 * e), gy = (cv2FaceZ(x, y + e) - cv2FaceZ(x, y - e)) / (2 * e);
+  const n = cv2V(-gx * 0.7, -gy * 0.4, 1).normalize();
+  return { pos: cv2V(x, y, cv2FaceZ(x, y) - 0.031), q: new THREE.Quaternion().setFromUnitVectors(cv2V(0, 0, 1), n) };
+}
+// proyecta una geometría plana (XY, mirando a +Z) sobre la cara
+function cv2OnFace(g, cx, cy, push, rz = 0, sx = 1, sy = sx) {
+  const P = g.attributes.position, N = g.attributes.normal, c = Math.cos(rz), s = Math.sin(rz);
+  for (let i = 0; i < P.count; i++) {
+    const x = P.getX(i) * sx, y = P.getY(i) * sy, X = cx + x * c - y * s, Y = cy + x * s + y * c;
+    P.setXYZ(i, X, Y, cv2FaceZ(X, Y) + push + P.getZ(i));
+    const nx = N.getX(i), ny = N.getY(i); N.setXYZ(i, nx * c - ny * s, nx * s + ny * c, N.getZ(i));
+  }
+  return g;
+}
+// casquete que abraza el cráneo (pelo, gorros). Borde: y = mid + tilt*cos(phi) - side*sin²(phi)
+function cv2Shell(o) {
+  const nu = cv2S(o.nu || 28), nv = isTouch ? 7 : 10;
+  return cv2Grid(nu, nv, (u, v, i, j) => {
+    const phi = -Math.PI + 2 * Math.PI * u, cf = Math.cos(phi), sf = Math.sin(phi);
+    const th0 = cv2ThOf(o.mid + o.tilt * cf - (o.side || 0) * sf * sf);
+    const s = j === 0 ? 0 : (j - 1) / (nv - 1), th = th0 + (Math.PI / 2 - th0) * s;
+    let [r, y] = cv2HeadTh(th);
+    const inf = j === 0 ? o.inf - o.lip : o.inf;
+    r += inf * Math.cos(th); y += inf * Math.sin(th) + (o.top || 0) * s * s + (j === 0 ? 0.004 : 0);
+    return [r * sf, y, CV2H.dz * r * cf];
+  }, { wrap: true, poles: [nv] });
+}
+const CV2_LIDS = [[-0.95, 0], [-0.6, 0.12], [-0.34, 0.05]]; // [ángulo párpado, inclinación]
+function cv2HeadSkinGeo(lid) {
+  return G('cv2:headSkin:' + lid, () => {
+    const pts = []; const k = cv2S(24);
+    for (let i = 0; i <= k; i++) pts.push(cv2HeadTh(-Math.PI / 2 + i / k * Math.PI));
+    const parts = [{ g: cv2Lathe(pts, cv2S(30), CV2H.dz) }];
+    parts.push({ g: new THREE.CylinderGeometry(0.094, 0.1, 0.24, cv2S(12), 1, true), m: cv2M(0, 0.04, 0), fix: CV2_FIX });
+    parts.push({ g: new THREE.SphereGeometry(0.026, 10, 8), m: cv2M(0, 0.234, cv2FaceZ(0, 0.234) - 0.007, 0, 0, 0, 1.2, 0.8, 0.8), fix: CV2_FIX });
+    const [la, sl] = CV2_LIDS[lid];
+    for (const s of [-1, 1]) {
+      parts.push({ g: new THREE.SphereGeometry(0.068, 10, 8), m: cv2M(s * (cv2HeadR(0.3) - 0.016), 0.3, -0.02, 0, s * 0.25, -s * 0.1, 0.42, 0.95, 0.72), fix: CV2_FIX });
+      const X = cv2EyeXf(s), base = new THREE.Matrix4().compose(X.pos, X.q, cv2V(1, 1, 1));
+      const m = base.clone().multiply(new THREE.Matrix4().makeScale(CV2E.sx * 1.03, CV2E.sy * 1.03, CV2E.sz * 1.09)).multiply(new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(la, 0, s * sl, 'ZYX')));
+      parts.push({ g: new THREE.SphereGeometry(CV2E.r, cv2S(18), 7, 0, Math.PI * 2, 0, Math.PI / 2), m, fix: CV2_LIDUV });
+    }
+    return cv2Merge(parts);
+  });
+}
+function cv2WhiteGeo(mouth) { // escleróticas (+ dientes)
+  return G('cv2:white:' + (mouth === 1 ? 1 : 0), () => {
+    const parts = [];
+    for (const s of [-1, 1]) { const X = cv2EyeXf(s); parts.push({ g: new THREE.SphereGeometry(CV2E.r, cv2S(20), 14), m: new THREE.Matrix4().compose(X.pos, X.q, cv2V(CV2E.sx, CV2E.sy, CV2E.sz)) }); }
+    if (mouth === 1) parts.push({ g: cv2OnFace(new THREE.PlaneGeometry(0.088, 0.017, 6, 1).translate(0, -0.0085, 0), 0, 0.176, 0.006) });
+    return cv2Merge(parts);
+  });
+}
+const CV2_MOUTH = 0x2a0c18, CV2_TONGUE = 0xff5f86, CV2_LASH = 0x150c16;
+function cv2FeatGeo(mouth, lid, lash) { // pestañas + boca (colores de vértice)
+  return G('cv2:feat:' + mouth + ':' + lid + ':' + (lash ? 1 : 0), () => {
+    const parts = [], [la, sl] = CV2_LIDS[lid];
+    for (const s of [-1, 1]) {
+      const X = cv2EyeXf(s), base = new THREE.Matrix4().compose(X.pos, X.q, cv2V(1, 1, 1));
+      const m = base.clone().multiply(new THREE.Matrix4().makeScale(CV2E.sx * 1.045, CV2E.sy * 1.045, CV2E.sz * 1.13)).multiply(new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(la, 0, s * sl, 'ZYX')));
+      const t = new THREE.TorusGeometry(CV2E.r, 0.0085, 4, cv2S(18), Math.PI * 0.94).rotateX(Math.PI / 2); t.rotateY(-Math.PI * 0.03);
+      parts.push({ g: t, m, c: CV2_LASH });
+      // pestaña exterior (pequeño rabito en la esquina)
+      if (lash) {
+      const ph = s > 0 ? 0.5 : Math.PI - 0.5, v = cv2V(Math.cos(ph) * CV2E.r, 0, Math.sin(ph) * CV2E.r).applyMatrix4(m);
+      const f = new THREE.ConeGeometry(0.0115, 0.042, 5); f.translate(0, 0.021, 0);
+      parts.push({ g: f, m: new THREE.Matrix4().compose(v, new THREE.Quaternion().setFromUnitVectors(cv2V(0, 1, 0), cv2V(s, 0.75, 0.3).normalize()), cv2V(1, 1, 0.6)), c: CV2_LASH });
+      }
+    }
+    const my = 0.176;
+    if (mouth === 0) { const g = new THREE.TorusGeometry(0.052, 0.0115, 6, 16, 2.1); g.rotateZ(Math.PI + (Math.PI - 2.1) / 2); g.translate(0, 0.036, 0); parts.push({ g: cv2OnFace(g, 0, my, 0.004), c: CV2_MOUTH }); }
+    else if (mouth === 1) {
+      parts.push({ g: cv2OnFace(new THREE.CircleGeometry(0.062, 18, Math.PI, Math.PI), 0, my, 0.002, 0, 1, 0.85), c: CV2_MOUTH });
+      parts.push({ g: cv2OnFace(new THREE.CircleGeometry(0.03, 14).translate(0.006, -0.06, 0), 0, my, 0.003, 0, 1.25, 0.62), c: CV2_TONGUE });
+    } else if (mouth === 2) { const g = new THREE.TorusGeometry(0.042, 0.011, 6, 12, 1.8); g.rotateZ(Math.PI + (Math.PI - 1.8) / 2); g.translate(0, 0.03, 0); parts.push({ g: cv2OnFace(g, 0.024, my + 0.004, 0.004, 0.32), c: CV2_MOUTH }); }
+    else if (mouth === 3) { parts.push({ g: cv2OnFace(new THREE.CircleGeometry(0.024, 14), 0, my - 0.006, 0.002, 0, 1, 1.3), c: CV2_MOUTH }); }
+    else { for (const s of [-1, 1]) { const g = new THREE.TorusGeometry(0.022, 0.0095, 5, 10, Math.PI); g.rotateZ(Math.PI); g.translate(s * 0.021, 0.008, 0); parts.push({ g: cv2OnFace(g, 0, my, 0.004), c: CV2_MOUTH }); } }
+    return cv2Merge(parts);
+  });
+}
+const CV2_BROWS = [[0, 0.06, 0, 0.06], [0.012, -0.1, 0.012, -0.1], [0.022, -0.14, -0.004, 0.16], [-0.004, 0.22, -0.004, 0.22]]; // [dy izq, rot izq, dy der, rot der]
+function cv2BrowParts(style) {
+  const out = [], b = CV2_BROWS[style];
+  for (const s of [-1, 1]) {
+    const dy = s < 0 ? b[0] : b[2], rot = s < 0 ? b[1] : b[3];
+    const g = new THREE.TorusGeometry(0.07, 0.0165, 5, 10, 1.15); g.rotateZ(Math.PI / 2 - 0.575); g.translate(0, -0.07, 0); g.scale(1, 1, 0.55);
+    out.push({ g: cv2OnFace(g, s * 0.122, CV2E.y + 0.158 + dy, 0.006, s * rot), fix: CV2_FIX });
+  }
+  return out;
+}
+const CV2_HAIRBASE = { mid: 0.415, tilt: 0.115, side: 0.03, inf: 0.024, lip: 0.018, top: 0.012 };
+function cv2HairGeo(style, brow) {
+  return G('cv2:hair:' + style + ':' + brow, () => {
+    const parts = [], U = [5, 1.4], rr = cv2Rng(style.length * 13 + 5);
+    const base = Object.assign({}, CV2_HAIRBASE);
+    if (style === 'buzz') Object.assign(base, { inf: 0.012, lip: 0.01, top: 0 });
+    if (style === 'puff') Object.assign(base, { inf: 0.03, mid: 0.44, tilt: 0.15, side: 0.05 });
+    parts.push({ g: cv2Shell(base), uv: U });
+    if (style === 'quiff') {
+      parts.push({ g: new THREE.SphereGeometry(0.16, cv2S(18), 10), m: cv2M(0.035, 0.625, 0.1, -0.6, 0.15, 0.22, 1.1, 0.52, 0.8), uv: [3, 1] });
+      parts.push({ g: new THREE.SphereGeometry(0.12, cv2S(14), 8), m: cv2M(-0.1, 0.6, 0.12, -0.5, -0.2, -0.35, 1, 0.45, 0.75), uv: [3, 1] });
+    } else if (style === 'spikes') {
+      const sp = [[0, 1.0, 0.12], [0.62, 0.95, 0.11], [-0.62, 0.95, 0.11], [0.32, 1.32, 0.13], [-0.32, 1.32, 0.13], [Math.PI, 1.1, 0.12], [Math.PI - 0.8, 1.05, 0.11], [Math.PI + 0.8, 1.05, 0.11], [1.4, 0.85, 0.1], [-1.4, 0.85, 0.1]];
+      for (const [phi, th, h] of sp) {
+        const [r, y] = cv2HeadTh(th), p = cv2V(r * Math.sin(phi), y, CV2H.dz * r * Math.cos(phi));
+        const d = cv2V(Math.sin(phi) * Math.cos(th), Math.sin(th) + 0.25, Math.cos(phi) * Math.cos(th) - 0.45).normalize();
+        const g = new THREE.ConeGeometry(0.07, h + 0.06, 8, 1); g.translate(0, (h + 0.06) / 2, 0);
+        const m = new THREE.Matrix4().compose(p.addScaledVector(d, 0.0), new THREE.Quaternion().setFromUnitVectors(cv2V(0, 1, 0), d), cv2V(1, 1, 0.75));
+        parts.push({ g, m, uv: [2, 1] });
+      }
+    } else if (style === 'bun') {
+      parts.push({ g: new THREE.SphereGeometry(0.13, cv2S(18), 12), m: cv2M(0, 0.765, -0.1, -0.35, 0, 0, 1, 0.88, 1), uv: [3, 1.5] });
+    } else if (style === 'puff') {
+      const c0 = cv2V(0, 0.47, -0.06), n = 22;
+      for (let i = 0; i < n; i++) {
+        const y = 1 - (i + 0.5) / n * 1.7, rad = Math.sqrt(Math.max(0, 1 - y * y)), a = i * 2.39996;
+        const d = cv2V(Math.cos(a) * rad, y, Math.sin(a) * rad);
+        if (d.z > 0.3 && d.y < 0.55) d.z = 0.3;
+        if (d.y < 0.05 && d.z > -0.35) continue;
+        const p = c0.clone().add(cv2V(d.x * 0.25, d.y * 0.22, d.z * 0.25));
+        const rs = 0.13 + rr() * 0.04;
+        parts.push({ g: new THREE.SphereGeometry(rs, cv2S(12), 8), m: cv2M(p.x, p.y, p.z, rr(), rr(), rr()), uv: [2, 1.5] });
+      }
+    }
+    parts.push(...cv2BrowParts(brow));
+    return cv2Merge(parts);
+  });
+}
+function cv2HatGeo(hat, back) {
+  return G('cv2:hat:' + hat + (back ? 'B' : ''), () => {
+    const parts = [];
+    if (hat === 'beanie') {
+      const mid = 0.455, tilt = 0.06;
+      parts.push({ g: cv2Shell({ mid: mid + 0.09, tilt, inf: 0.052, lip: 0.022, top: 0.0 }), uv: [5, 2] });
+      const prof = [[0, 0.028], [-0.006, 0.052], [0.008, 0.07], [0.05, 0.077], [0.092, 0.07], [0.108, 0.052], [0.108, 0.03]], nu = cv2S(30);
+      parts.push({ g: cv2Grid(nu, prof.length - 1, (u, v, i, j) => {
+        const phi = -Math.PI + 2 * Math.PI * u, y = mid + tilt * Math.cos(phi) + prof[j][0], r = cv2HeadR(y) + prof[j][1];
+        return [r * Math.sin(phi), y, CV2H.dz * r * Math.cos(phi)];
+      }, { wrap: true }), uv: [7, 1] });
+      const pp = new THREE.SphereGeometry(0.085, cv2S(14), 10), P = pp.attributes.position, rr = cv2Rng(5);
+      const bump = []; for (let i = 0; i < 9; i++) bump.push(cv2V(rr() - 0.5, rr() - 0.5, rr() - 0.5).normalize());
+      for (let i = 0; i < P.count; i++) { const v = cv2V(P.getX(i), P.getY(i), P.getZ(i)), d = v.clone().normalize(); let k = 1; for (const b of bump) k += 0.16 * Math.max(0, d.dot(b) - 0.6) / 0.4; v.multiplyScalar(k); P.setXYZ(i, v.x, v.y, v.z); }
+      pp.computeVertexNormals();
+      parts.push({ g: pp, m: cv2M(0, 0.775, -0.015), uv: [2, 2] });
+    } else if (hat === 'cap') {
+      const mid = 0.5, zF = cv2FaceZ(0, mid - 0.005);
+      parts.push({ g: cv2Shell({ mid, tilt: 0, inf: 0.03, lip: 0.014, top: 0.018, nu: 36 }), uv: [1, 1] });
+      const br = new THREE.SphereGeometry(0.2, cv2S(22), 10), P = br.attributes.position;
+      br.scale(1.08, 0.085, 1);
+      for (let i = 0; i < P.count; i++) { const x = P.getX(i), z = P.getZ(i); P.setY(i, P.getY(i) - 0.55 * x * x - 0.12 * Math.max(0, z) * Math.max(0, z)); }
+      br.computeVertexNormals();
+      parts.push({ g: br, m: cv2M(0, mid - 0.008, zF + 0.035, 0.08, 0, 0), uv: [2, 1] });
+      parts.push({ g: new THREE.SphereGeometry(0.027, 10, 6), m: cv2M(0, CV2H.yc + CV2H.a + 0.05, 0, 0, 0, 0, 1, 0.6, 1), fix: [0.02, 0.5] });
+      if (back) return cv2Merge(parts).rotateY(Math.PI);
+    } else if (hat === 'phones') {
+      const band = new THREE.TorusGeometry(0.338, 0.026, 6, cv2S(26), Math.PI); band.scale(1, 1, 1.35);
+      parts.push({ g: band, m: cv2M(0, 0.37, -0.01) });
+      const cup = [[0, -0.045], [0.07, -0.046], [0.093, -0.036], [0.101, -0.012], [0.101, 0.012], [0.093, 0.036], [0.07, 0.046], [0, 0.047]];
+      for (const s of [-1, 1]) parts.push({ g: cv2Lathe(cup, cv2S(18)), m: cv2M(s * 0.352, 0.33, -0.005, 0, 0, -s * Math.PI / 2) });
+    } else if (hat === 'bun') {
+      parts.push({ g: new THREE.TorusGeometry(0.072, 0.026, 6, cv2S(16)), m: cv2M(0, 0.665, -0.065, Math.PI / 2 - 0.35, 0, 0), uv: [4, 1] });
+    }
+    return cv2Merge(parts);
+  });
+}
+function cv2PhonesExtra() {
+  return [G('cv2:padsP', () => cv2Merge([-1, 1].map(s => ({ g: new THREE.TorusGeometry(0.07, 0.03, 8, cv2S(16)), m: cv2M(s * 0.3, 0.33, -0.005, 0, Math.PI / 2, 0) })))),
+    G('cv2:glowP', () => cv2Merge([-1, 1].map(s => ({ g: new THREE.TorusGeometry(0.062, 0.011, 5, cv2S(18)), m: cv2M(s * 0.4, 0.33, -0.005, 0, Math.PI / 2, 0) }))))];
+}
+
+// ---------- torso / piernas / brazos ----------
+function cv2TorsoPts() {
+  if (CV2.torso) return CV2.torso;
+  const ctrl = [[0.249, -0.047], [0.256, -0.028], [0.262, 0.05], [0.274, 0.22], [0.295, 0.42], [0.326, 0.6], [0.342, 0.675], [0.328, 0.74], [0.272, 0.795], [0.18, 0.845], [0.112, 0.872], [0.095, 0.88]];
+  return CV2.torso = new THREE.SplineCurve(ctrl.map(p => new THREE.Vector2(p[0], p[1]))).getSpacedPoints(cv2S(26)).map(v => [v.x, v.y]);
+}
+function cv2TorsoR(y) { const p = cv2TorsoPts(); for (let i = 2; i < p.length; i++) if (p[i][1] >= y) { const a = p[i - 1], b = p[i], t = (y - a[1]) / (b[1] - a[1] || 1); return a[0] + (b[0] - a[0]) * cv2Cl(t, 0, 1); } return p[p.length - 1][0]; }
+const cv2TorsoZ = (x, y) => { const r = cv2TorsoR(y); return CV2TZ * Math.sqrt(Math.max(0, r * r - x * x)); };
+function cv2ShirtGeo(top) {
+  return G('cv2:shirt:' + top, () => {
+    const parts = [{ g: cv2Lathe(cv2TorsoPts(), cv2S(28), CV2TZ), uv: [8, 4] }];
+    if (top === 'hoodie') {
+      parts.push({ g: new THREE.SphereGeometry(0.21, cv2S(18), 10), m: cv2M(0, 0.745, -0.15, 0.35, 0, 0, 1.22, 0.72, 0.62), uv: [3, 2] }); // capucha
+      parts.push({ g: cv2Ring(0.138, 0.046, 0.835, 0.82, cv2S(22)), uv: [4, 1] }); // cuello de la capucha
+      parts.push({ g: new THREE.SphereGeometry(0.16, cv2S(16), 8), m: cv2M(0, 0.2, cv2TorsoZ(0, 0.2) - 0.012, 0, 0, 0, 1.18, 0.56, 0.16), uv: [2, 1] }); // bolsillo canguro
+    } else parts.push({ g: cv2Ring(0.262, 0.017, -0.05, CV2TZ, cv2S(28)), uv: [6, 1] }); // dobladillo
+    return cv2Merge(parts);
+  });
+}
+function cv2TrimGeo(top) {
+  return G('cv2:trim:' + top, () => {
+    if (top === 'hoodie') return cv2Merge([{ g: cv2Lathe([[0.24, -0.08], [0.268, -0.074], [0.272, -0.04], [0.27, 0.01], [0.258, 0.02]], cv2S(28), CV2TZ), uv: [10, 1] }]);
+    return cv2Merge([{ g: cv2Ring(0.118, 0.026, 0.858, 0.82, cv2S(22)), uv: [10, 1] }]);
+  });
+}
+function cv2PrintGeo(y0) {
+  return G('cv2:print:' + y0, () => {
+    const g = new THREE.PlaneGeometry(0.19, 0.19, 6, 6), P = g.attributes.position;
+    for (let i = 0; i < P.count; i++) { const x = P.getX(i), y = P.getY(i) + y0; P.setXYZ(i, x, y, cv2TorsoZ(x, y) + 0.006); }
+    g.computeVertexNormals(); return g;
+  });
+}
+function cv2PelvisGeo() {
+  return G('cv2:pelvis', () => cv2Merge([
+    { g: cv2Lathe([[0, -0.105], [0.08, -0.1], [0.16, -0.085], [0.222, -0.058], [0.248, -0.025], [0.244, 0.0], [0.232, 0.05], [0.218, 0.1], [0.18, 0.14]], cv2S(26), 0.6), uv: [2, 1.4] }
+  ]));
+}
+function cv2ArmGeo(kind, s) { // piezas de brazo por tipo
+  return G('cv2:arm:' + kind + ':' + s, () => {
+    const hand = () => [
+      { g: new THREE.SphereGeometry(0.08, cv2S(14), 10), m: cv2M(0, -0.44, 0.005, 0, 0, 0, 0.8, 1.02, 0.98) },
+      { g: new THREE.SphereGeometry(0.032, 8, 6), m: cv2M(-s * 0.035, -0.405, 0.058, 0.55, 0, 0, 1, 1.5, 1) }
+    ];
+    if (kind === 'upperSkin') return cv2Capsule(0.074, 0.07, 0.42);
+    if (kind === 'upperLong') return cv2Merge([{ g: cv2Capsule(0.094, 0.084, 0.42), uv: [2, 2] }]);
+    if (kind === 'sleeve') return cv2Merge([{ g: cv2Lathe([[0.078, -0.19], [0.108, -0.2], [0.113, -0.182], [0.11, -0.08], [0.106, 0.0], [0.097, 0.04], [0.074, 0.068], [0.038, 0.083], [0, 0.088]], cv2S(16)), uv: [2, 1] }]);
+    if (kind === 'hem') return cv2Ring(0.109, 0.017, -0.196, 1, cv2S(16));
+    if (kind === 'foreSkin') return cv2Merge([{ g: cv2Capsule(0.07, 0.058, 0.36) }, ...hand()]);
+    if (kind === 'foreLong') return cv2Merge([{ g: cv2Capsule(0.084, 0.073, 0.32), uv: [2, 2] }]);
+    if (kind === 'cuff') return cv2Merge([{ g: cv2Lathe([[0.06, -0.385], [0.08, -0.38], [0.086, -0.36], [0.086, -0.315], [0.082, -0.3], [0.07, -0.297]], cv2S(14)), uv: [6, 1] }]);
+    return cv2Merge(hand());
+  });
+}
+const CV2_SH = { W: 0.112, zc: 0.045, Lf: 0.205, Lb: 0.155, yS: -0.497 };
+const cv2ShoeH = z => 0.072 + 0.088 * cv2Sm(0.2, -0.02, z);
+const cv2ToeLift = z => 0.028 * cv2Sm(0.12, 0.27, z);
+function cv2ShoeOut(phi) { const { W, Lf, Lb } = CV2_SH, s = Math.sin(phi), c = Math.cos(phi); return [W * cv2P(s, 0.72), (c > 0 ? Lf : Lb) * cv2P(c, 0.72)]; }
+function cv2ShoeGeo() { // empeine + collarín
+  return G('cv2:shoe', () => {
+    const { zc, yS } = CV2_SH;
+    const up = cv2Grid(cv2S(22), isTouch ? 6 : 9, (u, v) => {
+      const phi = -Math.PI + 2 * Math.PI * u, e = v * Math.PI / 2, [x0, z0] = cv2ShoeOut(phi), c = Math.pow(Math.cos(e), 0.65);
+      const z = zc + z0 * c - 0.035 * Math.sin(e);
+      return [x0 * c, yS + cv2ShoeH(z) * Math.pow(Math.sin(e), 0.8) + cv2ToeLift(z), z];
+    }, { wrap: true, poles: [isTouch ? 6 : 9] });
+    return cv2Merge([{ g: up, uv: [3, 1] }, { g: cv2Ring(0.08, 0.024, -0.365, 1, cv2S(14)), uv: [4, 1] }]);
+  });
+}
+function cv2WhiteLegGeo(sock) { // suela + cordones (+ calcetín)
+  return G('cv2:sole:' + (sock ? 1 : 0), () => {
+    const { zc, yS } = CV2_SH, rows = [[0, -0.536], [0.9, -0.536], [1.0, -0.531], [1.045, -0.516], [1.045, -0.5], [1.0, -0.49], [0.9, -0.488]];
+    const sole = cv2Grid(cv2S(22), rows.length - 1, (u, v, i, j) => {
+      const phi = -Math.PI + 2 * Math.PI * u, [x0, z0] = cv2ShoeOut(phi), [c, y] = rows[j], z = zc + z0 * c;
+      return [x0 * c, y + cv2ToeLift(z), z];
+    }, { wrap: true, poles: [0] });
+    const parts = [{ g: sole }];
+    const lineZ = e => zc + CV2_SH.Lf * Math.pow(Math.cos(e), 0.65) - 0.035 * Math.sin(e);
+    for (const tz of sock ? [0.062, 0.1, 0.138] : [0.135, 0.17]) { // con pantalón largo solo asoman los cordones delanteros
+      let lo = 0, hi = Math.PI / 2; for (let k = 0; k < 24; k++) { const m = (lo + hi) / 2; if (lineZ(m) > tz) lo = m; else hi = m; }
+      const y = yS + cv2ShoeH(tz) * Math.pow(Math.sin(lo), 0.8) + cv2ToeLift(tz);
+      parts.push({ g: new THREE.CylinderGeometry(0.0105, 0.0105, 0.088, 6), m: cv2M(0, y + 0.004, tz, 0.5, 0, Math.PI / 2) });
+    }
+    if (sock) parts.push({ g: new THREE.SphereGeometry(0.03, 8, 6), m: cv2M(0, -0.385, -0.098, 0, 0, 0, 1.4, 1.6, 0.7) }); // lengüeta trasera
+    if (sock) parts.push({ g: cv2Lathe([[0.07, -0.44], [0.082, -0.43], [0.086, -0.34], [0.082, -0.318], [0.07, -0.312]], cv2S(14)) });
+    return cv2Merge(parts);
+  });
+}
+function cv2LegGeo(kind) {
+  return G('cv2:leg:' + kind, () => {
+    if (kind === 'thighPants') return cv2Merge([{ g: cv2Capsule(0.134, 0.106, 0.48, cv2S(16)), uv: [1, 1.6] }]);
+    if (kind === 'thighSkin') return cv2Capsule(0.086, 0.097, 0.48);
+    if (kind === 'shorts') return cv2Merge([{ g: cv2Lathe([[0.104, -0.318], [0.146, -0.33], [0.155, -0.305], [0.152, -0.27], [0.142, -0.258], [0.144, -0.2], [0.142, -0.07], [0.134, 0.0], [0.11, 0.045], [0.062, 0.078], [0, 0.088]], cv2S(18)), uv: [1, 1] }]);
+    if (kind === 'shinPants') {
+      const p = [[0.075, -0.415], [0.112, -0.41], [0.115, -0.388], [0.108, -0.36], [0.104, -0.2]];
+      for (let i = 0; i <= 5; i++) { const a = i / 5 * Math.PI / 2; p.push([0.106 * Math.cos(a), 0.106 * Math.sin(a)]); }
+      return cv2Merge([{ g: cv2Lathe(p, cv2S(16)), uv: [1, 1.2] }]);
+    }
+    return cv2Capsule(0.096, 0.07, 0.4); // shinSkin
+  });
+}
+
+// ---------- paraguas para planear ----------
+const CV2_U = { x: 0.47, z: 0.13, a1: 1.12, R: 1.7, yT: 4.42, k: 0.975 };
+const cv2UProf = a => [CV2_U.R * Math.sin(a), CV2_U.yT - CV2_U.k * (1 - Math.cos(a))];
+function cv2Umbrella(col) {
+  const umb = new THREE.Group(); umb.visible = false;
+  const can = G('cv2:canopy', () => {
+    const nu = isTouch ? 16 : 32, nv = isTouch ? 6 : 9, rMax = CV2_U.R * Math.sin(CV2_U.a1);
+    return cv2Grid(nu, nv, (u, v, i, j) => {
+      const phi = -Math.PI + 2 * Math.PI * u;
+      let [r, y] = cv2UProf(j === 0 ? CV2_U.a1 : CV2_U.a1 * (1 - (j - 1) / (nv - 1)));
+      if (j === 0) { r -= 0.035; y -= 0.04; }
+      const f = ((phi + Math.PI) / (Math.PI / 4)) % 1, sc = Math.sin(Math.PI * f), w = Math.pow(r / rMax, 2);
+      r *= 1 - 0.075 * sc * w; y += 0.07 * sc * w;
+      return [r * Math.sin(phi), y, r * Math.cos(phi)];
+    }, { wrap: true, poles: [nv] });
+  });
+  const metal = G('cv2:umbMetal', () => {
+    const parts = [];
+    for (let k = 0; k < 8; k++) {
+      const phi = -Math.PI + k * Math.PI / 4, pts = [];
+      for (let t = 0; t <= 6; t++) { const [r, y] = cv2UProf(CV2_U.a1 * t / 6); pts.push(cv2V(r * 0.985 * Math.sin(phi), y - 0.03, r * 0.985 * Math.cos(phi))); }
+      parts.push({ g: new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), isTouch ? 6 : 10, 0.011, 4, false) });
+      parts.push({ g: new THREE.SphereGeometry(0.03, 6, 4), m: cv2M(pts[6].x, pts[6].y, pts[6].z) });
+      parts.push({ g: new THREE.TubeGeometry(new THREE.LineCurve3(cv2V(0, 3.64, 0), pts[3]), 1, 0.008, 4, false) });
+    }
+    parts.push({ g: new THREE.CylinderGeometry(0.02, 0.02, 1.95, 8), m: cv2M(0, 3.555, 0) });
+    parts.push({ g: new THREE.ConeGeometry(0.032, 0.16, 8), m: cv2M(0, 4.6, 0) });
+    parts.push({ g: new THREE.CylinderGeometry(0.038, 0.038, 0.09, 8), m: cv2M(0, 3.64, 0) });
+    return cv2Merge(parts);
+  });
+  const handle = G('cv2:umbHandle', () => {
+    const pts = [cv2V(0, 2.42, 0), cv2V(0, 2.32, 0)];
+    for (let i = 1; i <= 8; i++) { const t = i / 8 * Math.PI; pts.push(cv2V(0.075 - 0.075 * Math.cos(t), 2.3 - 0.075 * Math.sin(t), 0)); }
+    return cv2Merge([
+      { g: new THREE.CylinderGeometry(0.036, 0.031, 0.44, 10), m: cv2M(0, 2.6, 0) },
+      { g: new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), isTouch ? 10 : 18, 0.027, 7, false) },
+      { g: new THREE.SphereGeometry(0.03, 8, 6), m: cv2M(0.15, 2.3, 0) }
+    ]);
+  });
+  for (const [g, m] of [[can, cv2CanopyMat(col)], [metal, cv2Metal()], [handle, cv2Grip()]]) {
+    const me = new THREE.Mesh(g, m); me.position.set(CV2_U.x, 0, CV2_U.z); me.castShadow = true; umb.add(me);
+  }
+  return umb;
+}
+
+// ---------- aspecto ----------
+const CV2_SKINS = [0xf6d3bd, 0xf1c7a8, 0xe8b392, 0xd59a76, 0xc0835c, 0xa86a48, 0x8a5538, 0x74462e, 0x5e3a28];
+const CV2_SHIRTS = [0xff3d6e, 0x3de0d0, 0xffc94f, 0x7a6cff, 0xf4f1ea, 0x2b2b38, 0xff8a3d, 0x6bd66b, 0x3da5ff, 0xc77dff, 0xff6fb5, 0x24406b, 0xe0457b, 0x9be15d];
+const CV2_PANTS = [0x2b2b38, 0x34466e, 0x6b5a4a, 0x1f2a44, 0x8a8a9a, 0x5a2b44, 0x2f4f3f, 0x4a6fa5, 0xc9b48e];
+const CV2_HATS = ['beanie', 'cap', 'phones', 'bun', 'puff', 'none', 'beanie', 'cap', 'none'];
+const CV2_HAIR = [0x1b120e, 0x3b2416, 0x6b4426, 0xd9b26a, 0xe8e0d0, 0x8a2b2b, 0x1b120e, 0x3b2416, 0xff6fb5, 0x5fd0ff];
+const CV2_EYES = [0x6b4226, 0x8a5a2b, 0x3f8f5f, 0x3a7bd5, 0x5a6a7a, 0x9a6bff, 0x2e1c14];
+function randomLook() {
+  const hat = pick(CV2_HATS), top = Math.random() < 0.3 ? 'hoodie' : 'tee', shirt = pick(CV2_SHIRTS);
+  let sleeve = Math.random() < 0.35 ? pick([0x2b2b38, 0xf4f1ea, 0x1f2a44, pick(CV2_SHIRTS)]) : null;
+  if (sleeve === shirt) sleeve = null;
+  return {
+    skin: pick(CV2_SKINS), shirt, sleeve, short: top === 'tee' && Math.random() < 0.65, pants: pick(CV2_PANTS), shorts: Math.random() < 0.45,
+    shoes: pick([0xf2f2f2, 0x2b2b38, 0xff4f7b, 0x3da5ff, 0xffc94f, 0x59f08a, 0xa66bff]), hat,
+    hatColor: pick([0x2b2b38, 0xff4f7b, 0x3de8ff, 0xffc94f, 0x7a6cff, 0xe8e8f0, 0x6bd66b, 0xff8a3d]), hair: pick(CV2_HAIR),
+    // campos opcionales nuevos
+    eyes: pick(CV2_EYES), top, hairStyle: pick(['quiff', 'spikes', 'buzz', 'quiff']), mouth: pick([0, 0, 1, 1, 2, 3, 4]),
+    brow: Math.floor(Math.random() * 4), lid: pick([0, 1, 1, 2]), print: Math.random() < 0.55 ? Math.floor(Math.random() * CV2_PRINTS) : -1,
+    printColor: pick(NEON), capBack: hat === 'cap' && Math.random() < 0.35, freckles: Math.random() < 0.25, glow: pick(NEON), lashes: Math.random() < 0.45
+  };
+}
+function cv2Look(l) {
+  const o = Object.assign({ eyes: 0x6b4226, top: 'tee', hairStyle: 'quiff', mouth: 0, brow: 1, lid: 1, print: -1, printColor: 0x3de8ff, capBack: false, freckles: false, lashes: false }, l);
+  if (o.trim == null) o.trim = o.top === 'hoodie' ? cv2Mix(o.shirt, 0x000000, 0.3) : o.sleeve != null ? o.sleeve : cv2Lum(o.shirt) > 0.62 ? cv2Mix(o.shirt, 0x000000, 0.35) : cv2Mix(o.shirt, 0xffffff, 0.55);
+  if (o.glow == null) o.glow = NEON[(o.hatColor >>> 3) % NEON.length];
+  if (o.top !== 'hoodie') o.top = 'tee'; else o.short = false;
+  o.mouth = cv2Cl(o.mouth | 0, 0, 4); o.brow = cv2Cl(o.brow | 0, 0, 3); o.lid = cv2Cl(o.lid | 0, 0, 2);
+  if (!['quiff', 'spikes', 'buzz'].includes(o.hairStyle)) o.hairStyle = 'quiff';
+  return o;
+}
+
+// ---------- modelo ----------
 function makeGuy(look) {
-  const mats = [];
-  const M = (color, rough = 0.6) => { const m = std({ color, roughness: rough }); mats.push(m); return m; };
-  const skin = M(look.skin, 0.5), shirt = M(look.shirt), pants = M(look.pants, 0.85), shoe = M(look.shoes, 0.5);
-  const sleeve = look.sleeve != null ? M(look.sleeve) : null;
+  const L = cv2Look(look), T = cv2T(), mats = [];
+  const N2 = k => new THREE.Vector2(k, k);
+  const M = o => { if (typeof o.color === 'number') o.color = new THREE.Color(o.color).convertSRGBToLinear(); const m = std(o); mats.push(m); return m; };
+  const MV = o => { if (isTouch) return M(o); o.color = new THREE.Color(o.color).convertSRGBToLinear(); const m = new THREE.MeshPhysicalMaterial(Object.assign({ roughness: 0.8, metalness: 0, clearcoat: 0.35, clearcoatRoughness: 0.32 }, o)); mats.push(m); return m; };
+  const skinFace = MV({ color: L.skin, roughness: 1, map: T.face[L.freckles ? 1 : 0], roughnessMap: T.skinR });
+  const skin = MV({ color: L.skin, roughness: 1, roughnessMap: T.skinR });
+  const shirt = M({ color: L.shirt, roughness: 0.88, normalMap: T.jersey, normalScale: N2(0.35) });
+  const trim = M({ color: L.trim, roughness: 0.85, normalMap: T.knit, normalScale: N2(0.6) });
+  const sleeve = L.sleeve != null ? M({ color: L.sleeve, roughness: 0.88, normalMap: T.jersey, normalScale: N2(0.35) }) : shirt;
+  const pants = M({ color: L.pants, roughness: 0.9, normalMap: T.denim, normalScale: N2(0.6) });
+  const shoe = M({ color: L.shoes, roughness: 0.55, normalMap: T.jersey, normalScale: N2(0.4) });
+  const hair = M({ color: L.hair, roughness: 0.6, normalMap: L.hat === 'puff' ? T.curly : T.strands, normalScale: N2(0.9) });
+  const add = (geo, mat, parent, shadow = true) => { const m = new THREE.Mesh(geo, mat); m.castShadow = shadow; parent.add(m); return m; };
+
   const root = new THREE.Group();
-  const add = (geo, mat, x, y, z, parent, sx = 1, sy = 1, sz = 1) => { const m = new THREE.Mesh(geo, mat); m.position.set(x, y, z); m.scale.set(sx, sy, sz); m.castShadow = true; parent.add(m); return m; };
-  const limb = (key, r1, r2, len, mat, parent) => add(G(key, () => new THREE.CylinderGeometry(r1, r2, len, 10)), mat, 0, -len / 2, 0, parent);
   const body = new THREE.Group(); body.position.y = 1.06; root.add(body);
-  add(G('pelvis', () => new THREE.SphereGeometry(0.27, SEG, 10)), pants, 0, 0.02, 0, body, 1, 0.72, 0.78);
+  add(cv2PelvisGeo(), pants, body);
   const torso = new THREE.Group(); torso.position.y = 0.06; body.add(torso);
-  add(G('torso', () => new THREE.CylinderGeometry(0.31, 0.26, 0.7, SEG)), shirt, 0, 0.36, 0, torso, 1, 1, 0.74);
-  add(G('chest', () => new THREE.SphereGeometry(0.31, SEG, 10)), shirt, 0, 0.71, 0, torso, 1, 0.42, 0.74);
-  add(G('neck', () => new THREE.CylinderGeometry(0.075, 0.085, 0.24, 8)), skin, 0, 0.86, 0, torso);
-  const head = new THREE.Group(); head.position.set(0, 0.92, 0); torso.add(head);
-  add(G('head', () => new THREE.SphereGeometry(0.3, 26, 20)), skin, 0, 0.34, 0, head, 1, 1.2, 1);
+  add(cv2ShirtGeo(L.top), shirt, torso);
+  add(cv2TrimGeo(L.top), trim, torso);
+  if (L.top === 'hoodie') add(G('cv2:strings', () => cv2Merge([-1, 1].flatMap(s => [
+    { g: new THREE.CylinderGeometry(0.009, 0.009, 0.17, 5), m: cv2M(s * 0.052, 0.715, cv2TorsoZ(s * 0.052, 0.715) + 0.032, -0.12, 0, s * 0.06) },
+    { g: new THREE.CylinderGeometry(0.014, 0.012, 0.03, 6), m: cv2M(s * 0.057, 0.625, cv2TorsoZ(s * 0.057, 0.625) + 0.03) }]))), cv2Rubber(), torso, false);
+  if (L.print >= 0) add(cv2PrintGeo(L.top === 'hoodie' ? 0.5 : 0.44), cv2PrintMat(L.print % CV2_PRINTS, L.printColor), torso, false);
+
+  // cabeza
+  const head = new THREE.Group(); head.position.y = 0.92; torso.add(head);
+  const hd = new THREE.Group(); hd.position.y = -0.035; hd.scale.setScalar(1.08); head.add(hd); // cabeza algo mayor y más baja (cuello corto)
+  add(cv2HeadSkinGeo(L.lid), skinFace, hd);
+  add(cv2WhiteGeo(L.mouth), cv2EyeWhite(), hd, false);
+  add(cv2FeatGeo(L.mouth, L.lid, L.lashes), cv2Feat(), hd, false);
   const pupils = [];
   for (const s of [-1, 1]) {
-    add(G('eyeW', () => new THREE.SphereGeometry(0.085, 14, 10)), eyeW, s * 0.11, 0.36, 0.265, head, 1, 1.18, 0.55);
-    pupils.push(add(G('eyeP', () => new THREE.SphereGeometry(0.04, 10, 8)), eyeB, s * 0.11, 0.355, 0.31, head));
+    const X = cv2EyeXf(s), p = add(G('cv2:iris', () => {
+      const th = 0.6, g = new THREE.SphereGeometry(CV2E.r, cv2S(18), 5, 0, Math.PI * 2, 0, th); g.rotateX(Math.PI / 2);
+      const P = g.attributes.position, U = g.attributes.uv, k = CV2E.r * Math.sin(th);
+      for (let i = 0; i < P.count; i++) U.setXY(i, 0.5 + P.getX(i) / (2 * k), 0.5 + P.getY(i) / (2 * k));
+      g.scale(CV2E.sx, CV2E.sy, CV2E.sz * 1.1); return g;
+    }), cv2IrisMat(L.eyes), hd, false);
+    p.position.copy(X.pos); p.quaternion.copy(X.q); p.userData.base = { x: X.pos.x, y: X.pos.y };
+    pupils.push(p);
   }
-  const mouth = add(G('mouth', () => new THREE.TorusGeometry(0.06, 0.013, 6, 12, Math.PI)), mouthMat, 0, 0.2, 0.275, head);
-  mouth.rotation.z = Math.PI; mouth.rotation.x = -0.25;
-  if (look.hat === 'beanie') {
-    const h = M(look.hatColor, 0.9);
-    add(G('beanie', () => new THREE.SphereGeometry(0.315, SEG, 10, 0, Math.PI * 2, 0, Math.PI * 0.55)), h, 0, 0.46, -0.01, head, 1, 1.15, 1.03);
-    add(G('cuff', () => new THREE.CylinderGeometry(0.31, 0.315, 0.12, SEG)), h, 0, 0.5, -0.01, head, 1, 1, 1.03);
-  } else if (look.hat === 'cap') {
-    const h = M(look.hatColor, 0.7);
-    add(G('capTop', () => new THREE.SphereGeometry(0.31, SEG, 10, 0, Math.PI * 2, 0, Math.PI / 2)), h, 0, 0.45, 0, head, 1, 0.95, 1.02);
-    add(G('brim', () => new THREE.CylinderGeometry(0.2, 0.2, 0.03, 16)), h, 0, 0.47, 0.27, head, 1, 1, 1.25);
-  } else if (look.hat === 'phones') {
-    const h = M(look.hatColor, 0.4);
-    const band = add(G('band', () => new THREE.TorusGeometry(0.36, 0.03, 6, 20, Math.PI)), h, 0, 0.36, 0, head);
-    band.rotation.y = Math.PI / 2;
-    for (const s of [-1, 1]) { const cup = add(G('cup', () => new THREE.CylinderGeometry(0.1, 0.1, 0.08, 14)), h, s * 0.31, 0.36, 0, head); cup.rotation.z = Math.PI / 2; }
-  } else if (look.hat === 'bun') {
-    const h = M(look.hair, 0.8);
-    add(G('hairCap', () => new THREE.SphereGeometry(0.31, SEG, 10, 0, Math.PI * 2, 0, Math.PI * 0.5)), h, 0, 0.42, -0.02, head, 1, 1.15, 1.03);
-    add(G('bunBall', () => new THREE.SphereGeometry(0.13, 12, 10)), h, 0, 0.8, -0.12, head);
-  } else if (look.hat === 'puff') {
-    add(G('puff', () => new THREE.IcosahedronGeometry(0.42, 1)), M(look.hair, 1), 0, 0.66, -0.09, head, 1, 0.82, 0.9);
+  // bajo gorro/gorra: pelo corto; con cascos no caben los pinchos
+  const hairStyle = L.hat === 'bun' || L.hat === 'puff' ? L.hat : L.hat === 'beanie' || L.hat === 'cap' ? 'buzz' : L.hat === 'phones' && L.hairStyle === 'spikes' ? 'quiff' : L.hairStyle;
+  add(cv2HairGeo(hairStyle, L.brow), hair, hd);
+  if (L.hat === 'beanie' || L.hat === 'cap' || L.hat === 'phones' || L.hat === 'bun') {
+    const hm = L.hat === 'beanie' ? M({ color: L.hatColor, roughness: 0.95, normalMap: T.knit, normalScale: N2(1.0) })
+      : L.hat === 'cap' ? M({ color: L.hatColor, roughness: 0.8, normalMap: T.cap, normalScale: N2(0.8) })
+      : L.hat === 'bun' ? M({ color: L.hatColor, roughness: 0.7, normalMap: T.knit, normalScale: N2(0.6) })
+      : M({ color: L.hatColor, roughness: 0.32, metalness: 0.1 });
+    add(cv2HatGeo(L.hat, L.capBack), hm, hd);
+    if (L.hat === 'phones') { const [pads, glow] = cv2PhonesExtra(); add(pads, cv2Pad(), hd, false); add(glow, cv2Glow(L.glow), hd, false); }
   }
+
+  // brazos y piernas
   const arms = [], elbows = [], legs = [], knees = [];
   let weaponSlot = null;
   for (const s of [-1, 1]) {
     const sh = new THREE.Group(); sh.position.set(s * 0.38, 0.66, 0); torso.add(sh);
-    add(G('shoulder', () => new THREE.SphereGeometry(0.11, 10, 8)), shirt, 0, 0, 0, sh);
-    if (look.short) { add(G('sleeveS', () => new THREE.CylinderGeometry(0.105, 0.095, 0.24, 10)), shirt, 0, -0.1, 0, sh); limb('upper', 0.075, 0.068, 0.42, skin, sh); }
-    else limb('upperL', 0.085, 0.075, 0.42, sleeve || shirt, sh);
     const el = new THREE.Group(); el.position.y = -0.42; sh.add(el);
-    limb('fore', 0.068, 0.058, 0.38, (!look.short || sleeve) ? (sleeve || shirt) : skin, el);
-    const hand = add(G('hand', () => new THREE.SphereGeometry(0.085, 10, 8)), skin, 0, -0.42, 0, el, 1, 1.1, 0.9);
+    if (L.short) {
+      add(cv2ArmGeo('upperSkin', 0), skin, sh);
+      add(cv2ArmGeo('sleeve', 0), sleeve, sh);
+      add(cv2ArmGeo('hem', 0), trim, sh, false);
+      add(cv2ArmGeo('foreSkin', s), skin, el);
+    } else {
+      add(cv2ArmGeo('upperLong', 0), sleeve, sh);
+      add(cv2ArmGeo('foreLong', 0), sleeve, el);
+      add(cv2ArmGeo('cuff', 0), trim, el, false);
+      add(cv2ArmGeo('hand', s), skin, el);
+    }
+    const hand = new THREE.Group(); hand.position.y = -0.42; el.add(hand);
     if (s === 1) { weaponSlot = new THREE.Group(); weaponSlot.position.set(0, -0.02, 0.02); hand.add(weaponSlot); }
     arms.push(sh); elbows.push(el);
+
     const hip = new THREE.Group(); hip.position.set(s * 0.15, -0.05, 0); body.add(hip);
-    limb('thigh', 0.115, 0.1, 0.48, pants, hip);
     const kn = new THREE.Group(); kn.position.y = -0.48; hip.add(kn);
-    limb('shin', 0.095, 0.075, 0.44, look.shorts ? skin : pants, kn);
-    add(G('shoe', () => new THREE.SphereGeometry(0.12, 10, 8)), shoe, 0, -0.47, 0.06, kn, 0.95, 0.62, 1.7);
+    if (L.shorts) {
+      add(cv2LegGeo('thighSkin'), skin, hip);
+      add(cv2LegGeo('shorts'), pants, hip);
+      add(cv2LegGeo('shinSkin'), skin, kn);
+    } else {
+      add(cv2LegGeo('thighPants'), pants, hip);
+      add(cv2LegGeo('shinPants'), pants, kn);
+    }
+    add(cv2ShoeGeo(), shoe, kn);
+    add(cv2WhiteLegGeo(L.shorts), cv2Rubber(), kn);
     legs.push(hip); knees.push(kn);
   }
-  const umb = new THREE.Group(); umb.visible = false; root.add(umb);
-  const can = new THREE.Mesh(G('canopy', () => new THREE.ConeGeometry(1.7, 0.75, 12, 1, true)), new THREE.MeshStandardMaterial({ color: pick(NEON), roughness: 0.5, side: THREE.DoubleSide, emissive: 0x220a22 }));
-  can.position.y = 4.0; umb.add(can);
-  const handle = new THREE.Mesh(G('handle', () => new THREE.CylinderGeometry(0.03, 0.03, 1.5, 6)), gunMetal); handle.position.y = 3.25; umb.add(handle);
+  const umb = cv2Umbrella(pick(NEON)); root.add(umb);
   return { root, body, torso, head, arms, elbows, legs, knees, pupils, weaponSlot, umb, mats };
 }
+// ================= fin char_v2 =================
 
 // ---------- estado ----------
 const NAMES = ['Mikel', 'Sofi', 'Dani', 'Lucho', 'Vale', 'Nico', 'Pau', 'Toño', 'Majo', 'Rulo', 'Cami', 'Beto', 'Gabi', 'Fer', 'Iker', 'Lola', 'Chema', 'Ari', 'Santi', 'Nati', 'Juanpa', 'Quique'];
@@ -1041,7 +2222,7 @@ function tryAttack(c, aimDir) {
   muzzle(c, _o);
   const spreadMul = c === player ? (aiming ? 0.45 : 1) * (c.grounded ? 1 : 1.6) : 1;
   if (w.proj) {
-    const m = new THREE.Mesh(G('rocket', () => new THREE.CylinderGeometry(0.09, 0.09, 0.6, 8)), rocketMat); m.position.copy(_o); scene.add(m);
+    const m = rocketModel(); m.position.copy(_o); scene.add(m);
     projs.push({ m, pos: _o.clone(), vel: aimDir.clone().multiplyScalar(w.speed), w, owner: c, life: 4 });
   } else {
     const o = _o.clone();
@@ -1667,9 +2848,15 @@ function updateHUD(dt) {
 // ---------- bucle principal ----------
 let last = performance.now(), stormTick = 0;
 const _mv = V(), _mr = V();
+let slowT = 0, lowQ = false;
 function frame(now) {
   requestAnimationFrame(frame);
-  const dt = Math.min(0.033, (now - last) / 1000); last = now;
+  const raw = (now - last) / 1000;
+  const dt = Math.min(0.033, raw); last = now;
+  if (!lowQ && gameState === 'play' && document.visibilityState === 'visible') {
+    slowT = raw > 0.045 && raw < 0.5 ? slowT + raw : Math.max(0, slowT - raw * 0.5);
+    if (slowT > 4) { lowQ = true; composer = null; renderer.setPixelRatio(1); renderer.setSize(innerWidth, innerHeight); moon.castShadow = false; }
+  }
   if (gameState === 'play') step(dt);
   else {
     const t = now / 1000 * 0.08; camera.position.set(Math.cos(t) * 105, 55, Math.sin(t) * 105); camera.lookAt(0, 10, 0);
@@ -1734,7 +2921,7 @@ function step(dt) {
 }
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
-  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, isTouch ? 1.5 : 2)); renderer.setSize(innerWidth, innerHeight);
+  renderer.setPixelRatio(lowQ ? 1 : Math.min(devicePixelRatio || 1, isTouch ? 1.5 : 2)); renderer.setSize(innerWidth, innerHeight);
   if (composer) { const pr = renderer.getPixelRatio(); composer.setSize(innerWidth * pr, innerHeight * pr); }
 });
 requestAnimationFrame(frame);
